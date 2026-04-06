@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TinyTransformer v3 — SageMaker MLOps stack.
+  Provisions: S3 bucket, IAM roles, SageMaker Model Package Group,
+  and all permissions needed for the GitHub Actions CI/CD pipeline.
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tiny-transformer
+    Description: Used as a prefix for all resource names.
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or username (e.g. myorg)
+
+  GitHubRepo:
+    Type: String
+    Default: transformer-genai
+    Description: GitHub repository name
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch that triggers the CI/CD pipeline
+
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.m5.large
+    AllowedValues:
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.c5.xlarge
+      - ml.g4dn.xlarge   # GPU — faster training
+    Description: SageMaker Training Job instance type
+
+  EndpointInstanceType:
+    Type: String
+    Default: ml.t2.medium
+    AllowedValues:
+      - ml.t2.medium
+      - ml.m5.large
+      - ml.c5.large
+    Description: SageMaker Endpoint instance type
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 bucket ────────────────────────────────────────────────────────────────
+  # Stores: training data, model artifacts, inference logs
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Keep old model artifacts for 90 days then move to Glacier
+          - Id: ArchiveOldModels
+            Status: Enabled
+            Prefix: models/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          # Delete incomplete multipart uploads after 7 days
+          - Id: CleanIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Block all public access
+  ModelBucketPublicAccessBlock:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ModelBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyPublicAccess
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${ModelBucket}"
+              - !Sub "arn:aws:s3:::${ModelBucket}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": false
+
+  # ── IAM Role — SageMaker Training + Endpoint ─────────────────────────────────
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-sagemaker-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ModelBucket}"
+                  - !Sub "arn:aws:s3:::${ModelBucket}/*"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ── IAM Role — GitHub Actions OIDC ───────────────────────────────────────────
+  # Allows GitHub Actions to assume this role without long-lived AWS keys.
+  # Uses OpenID Connect — the GitHub token is exchanged for temporary AWS creds.
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-actions-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                # Only allow the specific repo + branch
+                "token.actions.githubusercontent.com:sub":
+                  !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+      Policies:
+        - PolicyName: SageMakerPipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # SageMaker training jobs and endpoints
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:ListEndpoints
+                  - sagemaker:AddTags
+                Resource: "*"
+              # Model registry
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateModelPackage
+                  - sagemaker:DescribeModelPackage
+                  - sagemaker:ListModelPackages
+                  - sagemaker:UpdateModelPackage
+                Resource: "*"
+              # Pass the SageMaker execution role to training jobs
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SageMakerRole.Arn
+              # S3 — upload training data and read model artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ModelBucket}"
+                  - !Sub "arn:aws:s3:::${ModelBucket}/*"
+              # ECR — pull training container images
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+
+  # ── GitHub OIDC Provider ─────────────────────────────────────────────────────
+  # Only create if not already present in your account.
+  # Comment this out if you already have this OIDC provider.
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  # ── SageMaker Model Package Group (Model Registry) ───────────────────────────
+  # All trained model versions are registered here.
+  # Allows approving / rejecting versions before deployment.
+  ModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !Sub "${ProjectName}-models"
+      ModelPackageGroupDescription: "TinyTransformer v3 trained model versions"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+# These values are referenced by the GitHub Actions workflow.
+Outputs:
+
+  BucketName:
+    Description: S3 bucket for training data and model artifacts
+    Value: !Ref ModelBucket
+    Export:
+      Name: !Sub "${ProjectName}-bucket"
+
+  SageMakerRoleArn:
+    Description: IAM role ARN for SageMaker training jobs and endpoints
+    Value: !GetAtt SageMakerRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-sagemaker-role-arn"
+
+  GitHubActionsRoleArn:
+    Description: IAM role ARN for GitHub Actions OIDC (add to repo secrets as AWS_ROLE_ARN)
+    Value: !GetAtt GitHubActionsRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-github-actions-role-arn"
+
+  ModelPackageGroupName:
+    Description: SageMaker Model Registry group name
+    Value: !Ref ModelPackageGroup
+    Export:
+      Name: !Sub "${ProjectName}-model-package-group"

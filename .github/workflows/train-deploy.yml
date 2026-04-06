@@ -1,0 +1,315 @@
+name: Train and Deploy TinyTransformer
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+# Runs automatically on push to main.
+# Can also be triggered manually from the GitHub Actions UI.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sagemaker/code/**"        # only run when training code changes
+      - "sagemaker/data/**"        # or when training data changes
+      - ".github/workflows/train-deploy.yml"
+  workflow_dispatch:               # manual trigger
+    inputs:
+      steps:
+        description: "Training steps (default 50000)"
+        required: false
+        default: "50000"
+      temperature:
+        description: "Inference temperature (default 0.8)"
+        required: false
+        default: "0.8"
+
+# ── Permissions — required for OIDC token exchange ────────────────────────────
+permissions:
+  id-token: write   # request OIDC token
+  contents: read    # read repo
+
+# ── Environment variables ─────────────────────────────────────────────────────
+env:
+  AWS_REGION:        us-east-1
+  PROJECT_NAME:      tiny-transformer
+  STACK_NAME:        tiny-transformer-stack
+
+jobs:
+
+  # ── Job 1: Train ─────────────────────────────────────────────────────────────
+  train:
+    name: SageMaker Training Job
+    runs-on: ubuntu-latest
+
+    outputs:
+      # Pass model S3 path to the deploy job
+      model_s3_uri: ${{ steps.training.outputs.model_s3_uri }}
+      job_name:     ${{ steps.training.outputs.job_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Exchange GitHub OIDC token for temporary AWS credentials.
+      # No AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY needed in secrets.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # Read CloudFormation outputs to get bucket name and role ARN
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "bucket=$BUCKET"     >> $GITHUB_OUTPUT
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      # Upload training data to S3 (if data/ directory has a train.txt)
+      - name: Upload training data to S3
+        run: |
+          if [ -f sagemaker/data/train.txt ]; then
+            aws s3 cp sagemaker/data/train.txt \
+              s3://${{ steps.cfn.outputs.bucket }}/data/train.txt
+            echo "Uploaded train.txt"
+          else
+            echo "No train.txt found — training will use built-in text"
+          fi
+
+      # Upload training code to S3 (SageMaker downloads it into the container)
+      - name: Upload training code to S3
+        run: |
+          aws s3 sync sagemaker/code/ \
+            s3://${{ steps.cfn.outputs.bucket }}/code/ \
+            --exclude "*.pyc"
+
+      # Launch SageMaker Training Job
+      - name: Start SageMaker Training Job
+        id: training
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          JOB_NAME="${PROJECT_NAME}-${TIMESTAMP}"
+          STEPS="${{ github.event.inputs.steps || '50000' }}"
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          # Build input channels JSON
+          # If train.txt was uploaded, use it; otherwise omit the channel
+          if aws s3 ls s3://${BUCKET}/data/train.txt > /dev/null 2>&1; then
+            INPUT_CHANNELS=$(cat <<EOF
+          [{"ChannelName":"training","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://${BUCKET}/data/","S3DataDistributionType":"FullyReplicated"}}}]
+          EOF
+          )
+          else
+            INPUT_CHANNELS="[]"
+          fi
+
+          aws sagemaker create-training-job \
+            --training-job-name "$JOB_NAME" \
+            --algorithm-specification \
+              TrainingImage="763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-training:2.1.0-cpu-py310-ubuntu20.04-sagemaker",\
+          TrainingInputMode=File \
+            --role-arn "$ROLE_ARN" \
+            --input-data-config "$INPUT_CHANNELS" \
+            --output-data-config \
+              S3OutputPath="s3://${BUCKET}/models/" \
+            --resource-config \
+              InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=10 \
+            --stopping-condition MaxRuntimeInSeconds=3600 \
+            --hyper-parameters \
+              steps="$STEPS" \
+              seq-len=100 \
+              embed-dim=256 \
+              num-layers=2 \
+              lr=0.001 \
+            --environment \
+              Variables="{\"SAGEMAKER_PROGRAM\":\"train.py\",\"SAGEMAKER_SUBMIT_DIRECTORY\":\"s3://${BUCKET}/code/\"}"
+
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "Started training job: $JOB_NAME"
+
+      # Poll until training completes (max 55 minutes)
+      - name: Wait for training to complete
+        id: wait
+        run: |
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          echo "Waiting for $JOB_NAME ..."
+
+          for i in $(seq 1 55); do
+            STATUS=$(aws sagemaker describe-training-job \
+              --training-job-name "$JOB_NAME" \
+              --query "TrainingJobStatus" --output text)
+            echo "  [${i}m] status: $STATUS"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "Training completed."
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Stopped" ]; then
+              REASON=$(aws sagemaker describe-training-job \
+                --training-job-name "$JOB_NAME" \
+                --query "FailureReason" --output text)
+              echo "Training $STATUS: $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+      # Get the S3 URI of the trained model artifact
+      - name: Get model S3 URI
+        id: model_uri
+        run: |
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          MODEL_URI=$(aws sagemaker describe-training-job \
+            --training-job-name "$JOB_NAME" \
+            --query "ModelArtifacts.S3ModelArtifacts" \
+            --output text)
+          echo "model_s3_uri=$MODEL_URI" >> $GITHUB_OUTPUT
+          echo "Model artifact: $MODEL_URI"
+
+  # ── Job 2: Register model in SageMaker Model Registry ────────────────────────
+  register:
+    name: Register Model in Registry
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Register model package
+        id: register
+        run: |
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          GROUP_NAME="${PROJECT_NAME}-models"
+          COMMIT_SHA="${{ github.sha }}"
+
+          aws sagemaker create-model-package \
+            --model-package-group-name "$GROUP_NAME" \
+            --model-package-description "Commit $COMMIT_SHA — trained $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --inference-specification \
+              Containers="[{\"Image\":\"763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker\",\"ModelDataUrl\":\"${MODEL_URI}\",\"Environment\":{\"SAGEMAKER_PROGRAM\":\"inference.py\"}}]",\
+          SupportedContentTypes="application/json",\
+          SupportedResponseMIMETypes="application/json" \
+            --model-approval-status PendingManualApproval
+
+          echo "Model registered — pending manual approval in SageMaker Model Registry."
+          echo "Approve it at: https://console.aws.amazon.com/sagemaker/home#/model-registry"
+
+  # ── Job 3: Deploy to SageMaker Endpoint ──────────────────────────────────────
+  # This job runs AFTER the register job.
+  # In production you would add a manual approval gate (environment protection)
+  # before this job runs. See: Settings → Environments → required reviewers.
+  deploy:
+    name: Deploy to SageMaker Endpoint
+    runs-on: ubuntu-latest
+    needs: [train, register]
+    environment: production    # requires manual approval if configured
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create or update SageMaker endpoint
+        run: |
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          MODEL_NAME="${PROJECT_NAME}-model-${TIMESTAMP}"
+          CONFIG_NAME="${PROJECT_NAME}-config-${TIMESTAMP}"
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          # Create model object
+          aws sagemaker create-model \
+            --model-name "$MODEL_NAME" \
+            --execution-role-arn "$ROLE_ARN" \
+            --primary-container \
+              Image="763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker",\
+          ModelDataUrl="${MODEL_URI}",\
+          Environment="{\"SAGEMAKER_PROGRAM\":\"inference.py\"}"
+
+          # Create endpoint config
+          aws sagemaker create-endpoint-config \
+            --endpoint-config-name "$CONFIG_NAME" \
+            --production-variants \
+              VariantName=AllTraffic,\
+          ModelName="${MODEL_NAME}",\
+          InitialInstanceCount=1,\
+          InstanceType=ml.t2.medium,\
+          InitialVariantWeight=1
+
+          # Create or update endpoint
+          ENDPOINT_STATUS=$(aws sagemaker describe-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --query "EndpointStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$ENDPOINT_STATUS" = "NOT_FOUND" ]; then
+            echo "Creating new endpoint: $ENDPOINT_NAME"
+            aws sagemaker create-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          else
+            echo "Updating existing endpoint: $ENDPOINT_NAME (was $ENDPOINT_STATUS)"
+            aws sagemaker update-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          fi
+
+          echo "Endpoint: $ENDPOINT_NAME"
+          echo "Monitor at: https://console.aws.amazon.com/sagemaker/home#/endpoints"
+
+      - name: Wait for endpoint to be InService
+        run: |
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+          echo "Waiting for endpoint to be InService ..."
+
+          for i in $(seq 1 20); do
+            STATUS=$(aws sagemaker describe-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --query "EndpointStatus" --output text)
+            echo "  [${i}m] $STATUS"
+
+            if [ "$STATUS" = "InService" ]; then
+              echo "Endpoint is live."
+              break
+            elif [ "$STATUS" = "Failed" ]; then
+              REASON=$(aws sagemaker describe-endpoint \
+                --endpoint-name "$ENDPOINT_NAME" \
+                --query "FailureReason" --output text)
+              echo "Endpoint failed: $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+      - name: Smoke test endpoint
+        run: |
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+
+          RESPONSE=$(aws sagemaker-runtime invoke-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --content-type "application/json" \
+            --body '{"prompt":"The attention mechanism","max_tokens":30,"temperature":0.8}' \
+            /dev/stdout 2>/dev/null)
+
+          echo "Smoke test response: $RESPONSE"

@@ -41,7 +41,7 @@ jobs:
 
     outputs:
       # Pass model S3 path to the deploy job
-      model_s3_uri: ${{ steps.training.outputs.model_s3_uri }}
+      model_s3_uri: ${{ steps.model_uri.outputs.model_s3_uri }}
       job_name:     ${{ steps.training.outputs.job_name }}
 
     steps:

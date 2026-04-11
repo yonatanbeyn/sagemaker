@@ -82,7 +82,7 @@ jobs:
             echo "No train.txt found — training will use built-in text"
           fi
 
-      # Upload training code to S3 (SageMaker downloads it into the container)
+      # Upload training code to S3 (individual files — consumed via input channel below)
       - name: Upload training code to S3
         run: |
           aws s3 sync code/ \
@@ -99,15 +99,16 @@ jobs:
           BUCKET="${{ steps.cfn.outputs.bucket }}"
           ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
 
-          # Build input channels JSON
-          # If train.txt was uploaded, use it; otherwise omit the channel
+          # Code channel — always present; SageMaker downloads files to
+          # /opt/ml/input/data/code/ before the container entrypoint runs.
+          CODE_CHANNEL='{"ChannelName":"code","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://'"${BUCKET}"'/code/","S3DataDistributionType":"FullyReplicated"}}}'
+
+          # Training-data channel — only added when train.txt exists in S3
           if aws s3 ls s3://${BUCKET}/data/train.txt > /dev/null 2>&1; then
-            INPUT_CHANNELS=$(cat <<EOF
-          [{"ChannelName":"training","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://${BUCKET}/data/","S3DataDistributionType":"FullyReplicated"}}}]
-          EOF
-          )
+            TRAIN_CHANNEL='{"ChannelName":"training","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://'"${BUCKET}"'/data/","S3DataDistributionType":"FullyReplicated"}}}'
+            INPUT_CHANNELS="[${CODE_CHANNEL},${TRAIN_CHANNEL}]"
           else
-            INPUT_CHANNELS="[]"
+            INPUT_CHANNELS="[${CODE_CHANNEL}]"
           fi
 
           aws sagemaker create-training-job \
@@ -123,7 +124,7 @@ jobs:
               InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=10 \
             --stopping-condition MaxRuntimeInSeconds=3600 \
             --hyper-parameters "{\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\"}" \
-            --environment "SAGEMAKER_PROGRAM=train.py,SAGEMAKER_SUBMIT_DIRECTORY=s3://${BUCKET}/code/"
+            --environment "SAGEMAKER_PROGRAM=train.py,SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/input/data/code"
 
           echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
           echo "Started training job: $JOB_NAME"

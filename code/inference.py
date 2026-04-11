@@ -112,18 +112,22 @@ def model_fn(model_dir):
     print(f"[model_fn] Architecture: vocab={vocab_size}, seq_len={seq_len}, "
           f"embed_dim={embed_dim}, num_layers={num_layers}")
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[model_fn] Using device: {device}")
+
     # Build model with correct architecture
     model = TinyTransformer(vocab_size, seq_len, embed_dim, num_layers)
 
     # Load trained weights
     weights_path = os.path.join(model_dir, "model.pt")
-    state_dict   = torch.load(weights_path, map_location="cpu")
+    state_dict   = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict)
+    model.to(device)
     model.eval()
 
     print(f"[model_fn] Weights loaded. model.eval() set.")
 
-    return {"model": model, "meta": meta}
+    return {"model": model, "meta": meta, "device": device}
 
 
 # ── SageMaker hook: parse request ────────────────────────────────────────────
@@ -160,6 +164,7 @@ def predict_fn(input_data, model_dict):
     """
     model       = model_dict["model"]
     meta        = model_dict["meta"]
+    device      = model_dict.get("device", torch.device("cpu"))
     SEQ_LEN     = meta["hyperparameters"]["seq_len"]
     vocab_size  = meta["vocab_size"]
 
@@ -183,7 +188,7 @@ def predict_fn(input_data, model_dict):
             if pad_count > 0:
                 context = [EOS_ID] * pad_count + context
 
-            x = torch.tensor([context])
+            x = torch.tensor([context]).to(device)
 
             logits   = model(x, pad_mask=None)
             logits_t = logits[0, -1] / temperature
@@ -191,7 +196,7 @@ def predict_fn(input_data, model_dict):
             probs    = torch.softmax(logits_t, dim=0)
 
             if torch.isnan(probs).any() or torch.isinf(probs).any():
-                probs = torch.ones(vocab_size) / vocab_size
+                probs = torch.ones(vocab_size, device=device) / vocab_size
 
             next_id = torch.multinomial(probs, 1).item()
 

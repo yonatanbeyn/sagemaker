@@ -107,12 +107,13 @@ CloudFormation stack: tiny-transformer-stack
 ```bash
 aws cloudformation deploy \
   --stack-name tiny-transformer-stack \
-  --template-file sagemaker/cloudformation/stack.yaml \
+  --template-file cloudformation/stack.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
   --parameter-overrides \
     ProjectName=tiny-transformer \
-    GitHubOrg=YOUR_GITHUB_USERNAME \
-    GitHubRepo=transformer-genai \
+    GitHubOrg=yonatanbeyn \
+    GitHubRepo=sagemaker \
     GitHubBranch=main
 ```
 

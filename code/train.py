@@ -63,6 +63,10 @@ print(f"  num_layers          : {NUM_LAYERS}")
 print(f"  steps               : {STEPS}")
 print(f"  lr                  : {LR}")
 
+# ── Device ───────────────────────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"  device              : {device}")
+
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 enc        = tiktoken.get_encoding("gpt2")
 EOS_ID     = enc.eot_token   # 50256
@@ -117,7 +121,7 @@ for tok_id in token_ids:
     if "." in enc.decode([tok_id]):
         encoded.append(EOS_ID)
 
-data = torch.tensor(encoded)
+data = torch.tensor(encoded).to(device)
 
 print(f"  BPE tokens  : {len(token_ids)}")
 print(f"  With EOS    : {len(encoded)}")
@@ -197,11 +201,11 @@ class TinyTransformer(nn.Module):
 
 
 # ── Build model ───────────────────────────────────────────────────────────────
-model       = TinyTransformer()
+model       = TinyTransformer().to(device)
 total_params = sum(p.numel() for p in model.parameters())
 print(f"\n  Total parameters: {total_params:,}")
 
-eos_weights         = torch.ones(vocab_size)
+eos_weights         = torch.ones(vocab_size, device=device)
 eos_weights[EOS_ID] = 0.1
 loss_fn   = nn.CrossEntropyLoss(weight=eos_weights)
 optimizer = optim.Adam(model.parameters(), lr=LR)

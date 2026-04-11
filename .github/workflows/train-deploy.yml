@@ -188,13 +188,12 @@ jobs:
           GROUP_NAME="${PROJECT_NAME}-models"
           COMMIT_SHA="${{ github.sha }}"
 
+          INFERENCE_SPEC="{\"Containers\":[{\"Image\":\"763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker\",\"ModelDataUrl\":\"${MODEL_URI}\",\"Environment\":{\"SAGEMAKER_PROGRAM\":\"inference.py\"}}],\"SupportedContentTypes\":[\"application/json\"],\"SupportedResponseMIMETypes\":[\"application/json\"]}"
+
           aws sagemaker create-model-package \
             --model-package-group-name "$GROUP_NAME" \
             --model-package-description "Commit $COMMIT_SHA — trained $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --inference-specification \
-              Containers="[{\"Image\":\"763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker\",\"ModelDataUrl\":\"${MODEL_URI}\",\"Environment\":{\"SAGEMAKER_PROGRAM\":\"inference.py\"}}]",\
-          SupportedContentTypes="application/json",\
-          SupportedResponseMIMETypes="application/json" \
+            --inference-specification "$INFERENCE_SPEC" \
             --model-approval-status PendingManualApproval
 
           echo "Model registered — pending manual approval in SageMaker Model Registry."

@@ -1,7 +1,7 @@
 name: Train and Deploy TinyTransformer
 
 # ── Trigger ───────────────────────────────────────────────────────────────────
-# Runs automatically on push to main.
+# Runs automatically on push to main branch.
 # Can also be triggered manually from the GitHub Actions UI.
 on:
   push:

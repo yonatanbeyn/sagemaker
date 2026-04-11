@@ -18,7 +18,6 @@ Architecture (v3, unchanged):
   LayerNorm + head Linear(256 → 50257)
   Total params ≈ 26M
 """
-
 import os
 import json
 import argparse

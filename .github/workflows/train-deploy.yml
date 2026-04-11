@@ -123,8 +123,7 @@ jobs:
               InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=10 \
             --stopping-condition MaxRuntimeInSeconds=3600 \
             --hyper-parameters "{\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\"}" \
-            --environment \
-              Variables={SAGEMAKER_PROGRAM=train.py,SAGEMAKER_SUBMIT_DIRECTORY="s3://${BUCKET}/code/"}
+            --environment "SAGEMAKER_PROGRAM=train.py,SAGEMAKER_SUBMIT_DIRECTORY=s3://${BUCKET}/code/"
 
           echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
           echo "Started training job: $JOB_NAME"

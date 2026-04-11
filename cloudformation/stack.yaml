@@ -148,9 +148,10 @@ Resources:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
               StringLike:
-                # Only allow the specific repo + branch
+                # Allow the specific repo on the main branch OR any environment
                 "token.actions.githubusercontent.com:sub":
-                  !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:*"
       Policies:
         - PolicyName: SageMakerPipelineAccess
           PolicyDocument:

@@ -126,6 +126,7 @@ Get the GitHubActionsRole ARN from the stack output:
 ```bash
 aws cloudformation describe-stacks \
   --stack-name tiny-transformer-stack \
+  --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='GitHubActionsRoleArn'].OutputValue" \
   --output text
 ```
@@ -187,6 +188,7 @@ GitHub Actions: train-deploy.yml
 # Replace with your actual endpoint name and region
 aws sagemaker-runtime invoke-endpoint \
   --endpoint-name tiny-transformer-endpoint \
+  --region us-east-1 \
   --content-type application/json \
   --body '{"prompt": "The attention mechanism", "max_tokens": 80, "temperature": 0.8}' \
   response.json
@@ -256,7 +258,7 @@ python code/inference.py ./model_output
 
 Stop the endpoint when not in use:
 ```bash
-aws sagemaker delete-endpoint --endpoint-name tiny-transformer-endpoint
+aws sagemaker delete-endpoint --endpoint-name tiny-transformer-endpoint --region us-east-1
 ```
 
 ---
@@ -271,3 +273,13 @@ aws sagemaker delete-endpoint --endpoint-name tiny-transformer-endpoint
 | Inference         | generate_verbose() in same file     | Separate inference.py with 4 SM hooks |
 | Weights loading   | Not needed (trained in same process)| model.pt via torch.load()             |
 | Serving           | Direct Python function call         | HTTP POST to /invocations              |
+
+[//]: # (aws cloudformation deploy \)
+
+[//]: # (--stack-name tiny-transformer-stack \)
+
+[//]: # (--template-file cloudformation/stack.yaml \)
+
+[//]: # (--capabilities CAPABILITY_NAMED_IAM \)
+
+[//]: # (--parameter-overrides GitHubOrg=yonatanbeyn )

@@ -197,6 +197,11 @@ Resources:
                   - ecr:BatchGetImage
                   - ecr:GetAuthorizationToken
                 Resource: "*"
+              # CloudFormation — read stack outputs (bucket name, role ARN)
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
 
   # ── GitHub OIDC Provider ─────────────────────────────────────────────────────
   # Only create if not already present in your account.

@@ -82,12 +82,15 @@ jobs:
             echo "No train.txt found — training will use built-in text"
           fi
 
-      # Upload training code to S3 (individual files — consumed via input channel below)
+      # Package and upload training code as sourcedir.tar.gz.
+      # The SageMaker training toolkit reads sagemaker_submit_directory from
+      # hyperparameters (not env vars) and downloads + extracts this archive
+      # to /opt/ml/code/ before running the entry point.
       - name: Upload training code to S3
         run: |
-          aws s3 sync code/ \
-            s3://${{ steps.cfn.outputs.bucket }}/code/ \
-            --exclude "*.pyc"
+          tar czf sourcedir.tar.gz -C code .
+          aws s3 cp sourcedir.tar.gz \
+            s3://${{ steps.cfn.outputs.bucket }}/code/sourcedir.tar.gz
 
       # Launch SageMaker Training Job
       - name: Start SageMaker Training Job
@@ -99,17 +102,16 @@ jobs:
           BUCKET="${{ steps.cfn.outputs.bucket }}"
           ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
 
-          # Code channel — always present; SageMaker downloads files to
-          # /opt/ml/input/data/code/ before the container entrypoint runs.
-          CODE_CHANNEL='{"ChannelName":"code","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://'"${BUCKET}"'/code/","S3DataDistributionType":"FullyReplicated"}}}'
-
           # Training-data channel — only added when train.txt exists in S3
           if aws s3 ls s3://${BUCKET}/data/train.txt > /dev/null 2>&1; then
-            TRAIN_CHANNEL='{"ChannelName":"training","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://'"${BUCKET}"'/data/","S3DataDistributionType":"FullyReplicated"}}}'
-            INPUT_CHANNELS="[${CODE_CHANNEL},${TRAIN_CHANNEL}]"
+            INPUT_CHANNELS='[{"ChannelName":"training","DataSource":{"S3DataSource":{"S3DataType":"S3Prefix","S3Uri":"s3://'"${BUCKET}"'/data/","S3DataDistributionType":"FullyReplicated"}}}]'
           else
-            INPUT_CHANNELS="[${CODE_CHANNEL}]"
+            INPUT_CHANNELS="[]"
           fi
+
+          # sagemaker_program and sagemaker_submit_directory are toolkit-reserved
+          # hyperparameters — the toolkit strips them before passing args to train.py.
+          HP="{\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\",\"sagemaker_program\":\"train.py\",\"sagemaker_submit_directory\":\"s3://${BUCKET}/code/sourcedir.tar.gz\"}"
 
           aws sagemaker create-training-job \
             --training-job-name "$JOB_NAME" \
@@ -123,8 +125,7 @@ jobs:
             --resource-config \
               InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=10 \
             --stopping-condition MaxRuntimeInSeconds=3600 \
-            --hyper-parameters "{\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\"}" \
-            --environment "SAGEMAKER_PROGRAM=train.py,SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/input/data/code"
+            --hyper-parameters "$HP"
 
           echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
           echo "Started training job: $JOB_NAME"

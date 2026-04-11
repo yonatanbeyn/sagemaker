@@ -7,8 +7,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "sagemaker/code/**"        # only run when training code changes
-      - "sagemaker/data/**"        # or when training data changes
+      - "code/**"                  # only run when training code changes
+      - "data/**"                  # or when training data changes
       - ".github/workflows/train-deploy.yml"
   workflow_dispatch:               # manual trigger
     inputs:
@@ -74,8 +74,8 @@ jobs:
       # Upload training data to S3 (if data/ directory has a train.txt)
       - name: Upload training data to S3
         run: |
-          if [ -f sagemaker/data/train.txt ]; then
-            aws s3 cp sagemaker/data/train.txt \
+          if [ -f data/train.txt ]; then
+            aws s3 cp data/train.txt \
               s3://${{ steps.cfn.outputs.bucket }}/data/train.txt
             echo "Uploaded train.txt"
           else
@@ -85,7 +85,7 @@ jobs:
       # Upload training code to S3 (SageMaker downloads it into the container)
       - name: Upload training code to S3
         run: |
-          aws s3 sync sagemaker/code/ \
+          aws s3 sync code/ \
             s3://${{ steps.cfn.outputs.bucket }}/code/ \
             --exclude "*.pyc"
 

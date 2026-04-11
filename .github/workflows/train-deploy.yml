@@ -116,14 +116,14 @@ jobs:
           aws sagemaker create-training-job \
             --training-job-name "$JOB_NAME" \
             --algorithm-specification \
-              TrainingImage="763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-training:2.1.0-cpu-py310-ubuntu20.04-sagemaker",\
+              TrainingImage="763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-training:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker",\
           TrainingInputMode=File \
             --role-arn "$ROLE_ARN" \
             --input-data-config "$INPUT_CHANNELS" \
             --output-data-config \
               S3OutputPath="s3://${BUCKET}/models/" \
             --resource-config \
-              InstanceType=ml.m5.large,InstanceCount=1,VolumeSizeInGB=10 \
+              InstanceType=ml.g4dn.xlarge,InstanceCount=1,VolumeSizeInGB=10 \
             --stopping-condition MaxRuntimeInSeconds=3600 \
             --hyper-parameters "$HP"
 

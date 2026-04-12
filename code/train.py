@@ -20,6 +20,7 @@ Architecture (v3, unchanged):
 """
 import os
 import json
+import shutil
 import argparse
 import torch
 import torch.nn as nn
@@ -284,5 +285,17 @@ metrics_path = os.path.join(SM_OUTPUT_DATA_DIR, "metrics.json")
 with open(metrics_path, "w") as f:
     json.dump(metrics, f, indent=2)
 print(f"  Saved metrics           → {metrics_path}")
+
+# 5. Bundle inference code into model.tar.gz
+# SageMaker inference container looks for custom handlers in model_dir/code/.
+# Placing inference.py + requirements.txt there activates our model_fn/predict_fn
+# instead of the default TorchScript handler.
+code_dir = os.path.join(SM_MODEL_DIR, "code")
+os.makedirs(code_dir, exist_ok=True)
+for fname in ["inference.py", "requirements.txt"]:
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+    if os.path.exists(src):
+        shutil.copy(src, os.path.join(code_dir, fname))
+        print(f"  Bundled {fname}         → {code_dir}/{fname}")
 
 print("\n  Done.")

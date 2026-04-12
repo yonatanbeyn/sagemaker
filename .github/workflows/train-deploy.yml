@@ -300,10 +300,13 @@ jobs:
         run: |
           ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
 
-          RESPONSE=$(aws sagemaker-runtime invoke-endpoint \
+          aws sagemaker-runtime invoke-endpoint \
             --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION" \
             --content-type "application/json" \
+            --cli-binary-format raw-in-base64-out \
             --body '{"prompt":"The attention mechanism","max_tokens":30,"temperature":0.8}' \
-            /dev/stdout 2>/dev/null)
+            /tmp/smoke_response.json
 
-          echo "Smoke test response: $RESPONSE"
+          echo "Smoke test response:"
+          cat /tmp/smoke_response.json

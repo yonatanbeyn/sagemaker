@@ -235,13 +235,12 @@ jobs:
           ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
 
           # Create model object
+          PRIMARY_CONTAINER="{\"Image\":\"763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker\",\"ModelDataUrl\":\"${MODEL_URI}\",\"Environment\":{\"SAGEMAKER_PROGRAM\":\"inference.py\"}}"
+
           aws sagemaker create-model \
             --model-name "$MODEL_NAME" \
             --execution-role-arn "$ROLE_ARN" \
-            --primary-container \
-              Image="763104351884.dkr.ecr.${AWS_REGION}.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker",\
-          ModelDataUrl="${MODEL_URI}",\
-          Environment="{\"SAGEMAKER_PROGRAM\":\"inference.py\"}"
+            --primary-container "$PRIMARY_CONTAINER"
 
           # Create endpoint config
           aws sagemaker create-endpoint-config \

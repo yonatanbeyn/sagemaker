@@ -273,13 +273,3 @@ aws sagemaker delete-endpoint --endpoint-name tiny-transformer-endpoint --region
 | Inference         | generate_verbose() in same file     | Separate inference.py with 4 SM hooks |
 | Weights loading   | Not needed (trained in same process)| model.pt via torch.load()             |
 | Serving           | Direct Python function call         | HTTP POST to /invocations              |
-
-[//]: # (aws cloudformation deploy \)
-
-[//]: # (--stack-name tiny-transformer-stack \)
-
-[//]: # (--template-file cloudformation/stack.yaml \)
-
-[//]: # (--capabilities CAPABILITY_NAMED_IAM \)
-
-[//]: # (--parameter-overrides GitHubOrg=yonatanbeyn )

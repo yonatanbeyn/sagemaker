@@ -71,16 +71,58 @@ jobs:
           echo "bucket=$BUCKET"     >> $GITHUB_OUTPUT
           echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
 
-      # Upload training data to S3 (if data/ directory has a train.txt)
-      - name: Upload training data to S3
+      # Build a real training corpus by scraping Tiny Shakespeare + Project
+      # Gutenberg books, then upload to S3. This avoids committing multi-MB
+      # text to the repo while still giving the 50k-vocab / 256-dim / 50k-step
+      # model enough real data to learn from.
+      - name: Build and upload training corpus to S3
         run: |
-          if [ -f data/train.txt ]; then
-            aws s3 cp data/train.txt \
-              s3://${{ steps.cfn.outputs.bucket }}/data/train.txt
-            echo "Uploaded train.txt"
-          else
-            echo "No train.txt found — training will use built-in text"
+          set -euo pipefail
+          CORPUS=/tmp/train.txt
+          : > "$CORPUS"
+
+          # 1) Tiny Shakespeare (~1.1 MB) — canonical tiny-LM corpus
+          echo "Fetching Tiny Shakespeare..."
+          curl -fsSL --retry 3 --retry-delay 2 \
+            https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \
+            >> "$CORPUS"
+          printf '\n\n' >> "$CORPUS"
+
+          # 2) Project Gutenberg books — large, public domain, varied prose.
+          #    1342 = Pride and Prejudice, 1661 = Sherlock Holmes,
+          #    84   = Frankenstein,        2701 = Moby Dick,
+          #    74   = Tom Sawyer
+          for ID in 1342 1661 84 2701 74; do
+            echo "Fetching Gutenberg #$ID..."
+            if ! curl -fsSL --retry 3 --retry-delay 2 \
+                 "https://www.gutenberg.org/cache/epub/${ID}/pg${ID}.txt" \
+                 -o /tmp/book.txt; then
+              echo "  WARN: failed to fetch #$ID — skipping"
+              continue
+            fi
+            python3 - <<'PY' >> "$CORPUS"
+          import re, sys
+          t = open('/tmp/book.txt', encoding='utf-8', errors='ignore').read()
+          m = re.search(r'\*\*\*\s*START OF .*?\*\*\*', t)
+          if m: t = t[m.end():]
+          m = re.search(r'\*\*\*\s*END OF .*?\*\*\*', t)
+          if m: t = t[:m.start()]
+          sys.stdout.write(t)
+          PY
+            printf '\n\n' >> "$CORPUS"
+          done
+
+          SIZE=$(wc -c < "$CORPUS")
+          LINES=$(wc -l < "$CORPUS")
+          echo "Corpus built: ${SIZE} bytes, ${LINES} lines"
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "ERROR: corpus too small (<1MB) — refusing to upload"
+            exit 1
           fi
+
+          aws s3 cp "$CORPUS" \
+            s3://${{ steps.cfn.outputs.bucket }}/data/train.txt
+          echo "Uploaded train.txt (${SIZE} bytes)"
 
       # Package and upload training code as sourcedir.tar.gz.
       # The SageMaker training toolkit reads sagemaker_submit_directory from

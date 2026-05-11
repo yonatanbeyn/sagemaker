@@ -13,9 +13,9 @@ on:
   workflow_dispatch:               # manual trigger
     inputs:
       steps:
-        description: "Training steps (default 50000)"
+        description: "Training steps (default 60000)"
         required: false
-        default: "50000"
+        default: "60000"
       temperature:
         description: "Inference temperature (default 0.8)"
         required: false
@@ -140,7 +140,7 @@ jobs:
         run: |
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           JOB_NAME="${PROJECT_NAME}-${TIMESTAMP}"
-          STEPS="${{ github.event.inputs.steps || '50000' }}"
+          STEPS="${{ github.event.inputs.steps || '60000' }}"
           BUCKET="${{ steps.cfn.outputs.bucket }}"
           ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
 

@@ -42,15 +42,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--seq-len",    type=int,   default=100)
 parser.add_argument("--embed-dim",  type=int,   default=256)
 parser.add_argument("--num-layers", type=int,   default=2)
-parser.add_argument("--steps",      type=int,   default=50000)
-parser.add_argument("--lr",         type=float, default=0.001)
+parser.add_argument("--steps",         type=int,   default=60000)
+parser.add_argument("--lr",            type=float, default=0.001)
+parser.add_argument("--eval-interval", type=int,   default=20000)
+parser.add_argument("--eval-batches",  type=int,   default=50)
 args = parser.parse_args()
 
-SEQ_LEN    = args.seq_len
-EMBED_DIM  = args.embed_dim
-NUM_LAYERS = args.num_layers
-STEPS      = args.steps
-LR         = args.lr
+SEQ_LEN       = args.seq_len
+EMBED_DIM     = args.embed_dim
+NUM_LAYERS    = args.num_layers
+STEPS         = args.steps
+LR            = args.lr
+EVAL_INTERVAL = args.eval_interval
+EVAL_BATCHES  = args.eval_batches
 
 print("=" * 60)
 print("  SageMaker Training Job — TinyTransformer v3")
@@ -62,6 +66,8 @@ print(f"  embed_dim           : {EMBED_DIM}")
 print(f"  num_layers          : {NUM_LAYERS}")
 print(f"  steps               : {STEPS}")
 print(f"  lr                  : {LR}")
+print(f"  eval_interval       : {EVAL_INTERVAL}")
+print(f"  eval_batches        : {EVAL_BATCHES}")
 
 # ── Device ───────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,9 +216,59 @@ eos_weights[EOS_ID] = 0.1
 loss_fn   = nn.CrossEntropyLoss(weight=eos_weights)
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
+# ── Eval + generate helpers ──────────────────────────────────────────────────
+
+@torch.no_grad()
+def eval_loss(n_batches=EVAL_BATCHES):
+    """Average loss over n_batches random windows — noise-reduced loss signal."""
+    model.eval()
+    total = 0.0
+    for _ in range(n_batches):
+        x, y   = get_batch()
+        x      = x.unsqueeze(0)
+        y      = y.unsqueeze(0)
+        logits = model(x, pad_mask=None)
+        total += loss_fn(logits.view(-1, vocab_size), y.view(-1)).item()
+    model.train()
+    return total / n_batches
+
+
+@torch.no_grad()
+def generate(prompt, max_tokens=30, temperature=0.8):
+    """Mirror of inference.py predict_fn — used for the post-training smoke test."""
+    model.eval()
+    idx        = enc.encode(prompt)
+    result_ids = list(idx)
+    for _ in range(max_tokens):
+        context   = result_ids[-SEQ_LEN:]
+        pad_count = SEQ_LEN - len(context)
+        if pad_count > 0:
+            context = [EOS_ID] * pad_count + context
+        x        = torch.tensor([context]).to(device)
+        logits   = model(x, pad_mask=None)
+        logits_t = torch.clamp(logits[0, -1] / temperature, min=-50, max=50)
+        probs    = torch.softmax(logits_t, dim=0)
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            probs = torch.ones(vocab_size, device=device) / vocab_size
+        next_id = torch.multinomial(probs, 1).item()
+        if next_id == EOS_ID:
+            break
+        result_ids.append(next_id)
+    model.train()
+    return enc.decode(result_ids)
+
+
+# Checkpoints land in SM_OUTPUT_DATA_DIR (uploaded to S3 as output.tar.gz)
+# rather than SM_MODEL_DIR — this keeps model.tar.gz lean for the inference
+# container while preserving intermediate checkpoints for offline analysis.
+checkpoint_dir = os.path.join(SM_OUTPUT_DATA_DIR, "checkpoints")
+os.makedirs(checkpoint_dir, exist_ok=True)
+
 # ── Training loop ─────────────────────────────────────────────────────────────
-print(f"\n  Training for {STEPS:,} steps ...")
+print(f"\n  Training for {STEPS:,} steps "
+      f"(eval + checkpoint every {EVAL_INTERVAL:,}) ...")
 training_log = []
+eval_log     = []
 
 for step in range(STEPS):
     x, y = get_batch()
@@ -231,7 +287,23 @@ for step in range(STEPS):
     if step % 5000 == 0:
         print(f"  step {step:6d}  loss: {loss.item():.4f}")
 
+    # Eval + checkpoint every EVAL_INTERVAL steps (incl. the final iteration).
+    if (step + 1) % EVAL_INTERVAL == 0:
+        completed = step + 1
+        avg_loss  = eval_loss()
+        ckpt_path = os.path.join(checkpoint_dir, f"checkpoint-{completed}.pt")
+        torch.save(model.state_dict(), ckpt_path)
+        eval_log.append({"step": completed, "eval_loss": round(avg_loss, 6)})
+        print(f"  step {completed:6d}  eval_loss: {avg_loss:.4f}  "
+              f"→ {os.path.basename(ckpt_path)}")
+
 print(f"  Training complete. Final loss: {training_log[-1]['loss']:.4f}")
+
+# ── Final smoke test (mirrors the GitHub Actions endpoint smoke test) ────────
+print("\n  Smoke test (prompt='The attention mechanism', "
+      "max_tokens=30, temperature=0.8):")
+smoke_output = generate("The attention mechanism", max_tokens=30, temperature=0.8)
+print(f"  → {smoke_output!r}")
 
 # ── Save model artifacts to SM_MODEL_DIR ─────────────────────────────────────
 # SageMaker will tar this directory and upload it to S3 after training.
@@ -268,7 +340,14 @@ metadata = {
         "lr":         LR,
         "steps":      STEPS
     },
-    "training_log": training_log
+    "training_log": training_log,
+    "eval_log":     eval_log,
+    "smoke_test": {
+        "prompt":      "The attention mechanism",
+        "max_tokens":  30,
+        "temperature": 0.8,
+        "output":      smoke_output,
+    },
 }
 meta_path = os.path.join(SM_MODEL_DIR, "metadata.json")
 with open(meta_path, "w") as f:
@@ -277,9 +356,11 @@ print(f"  Saved metadata          → {meta_path}")
 
 # 4. Metrics for SageMaker Model Monitor / Experiments
 metrics = {
-    "final_loss":  training_log[-1]["loss"],
-    "total_params": total_params,
-    "steps":        STEPS,
+    "final_loss":     training_log[-1]["loss"],
+    "final_eval_loss": eval_log[-1]["eval_loss"] if eval_log else None,
+    "total_params":   total_params,
+    "steps":          STEPS,
+    "eval_log":       eval_log,
 }
 metrics_path = os.path.join(SM_OUTPUT_DATA_DIR, "metrics.json")
 with open(metrics_path, "w") as f:

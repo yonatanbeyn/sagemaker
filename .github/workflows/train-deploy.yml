@@ -12,6 +12,14 @@ on:
       - ".github/workflows/train-deploy.yml"
   workflow_dispatch:               # manual trigger
     inputs:
+      mode:
+        description: "Training mode: text (default) or text2img"
+        required: false
+        default: "text"
+        type: choice
+        options:
+          - text
+          - text2img
       steps:
         description: "Training steps (default 50000)"
         required: false
@@ -20,6 +28,14 @@ on:
         description: "Inference temperature (default 0.8)"
         required: false
         default: "0.8"
+      vqvae-steps:
+        description: "VQ-VAE training steps for text2img mode (default 5000)"
+        required: false
+        default: "5000"
+      num-images:
+        description: "Number of synthetic training images for text2img (default 200)"
+        required: false
+        default: "200"
 
 # ── Permissions — required for OIDC token exchange ────────────────────────────
 permissions:
@@ -153,7 +169,11 @@ jobs:
 
           # sagemaker_program and sagemaker_submit_directory are toolkit-reserved
           # hyperparameters — the toolkit strips them before passing args to train.py.
-          HP="{\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\",\"sagemaker_program\":\"train.py\",\"sagemaker_submit_directory\":\"s3://${BUCKET}/code/sourcedir.tar.gz\"}"
+          MODE="${{ github.event.inputs.mode || 'text' }}"
+          VQVAE_STEPS="${{ github.event.inputs.vqvae-steps || '5000' }}"
+          NUM_IMAGES="${{ github.event.inputs.num-images || '200' }}"
+
+          HP="{\"mode\":\"$MODE\",\"steps\":\"$STEPS\",\"seq-len\":\"100\",\"embed-dim\":\"256\",\"num-layers\":\"2\",\"lr\":\"0.001\",\"vqvae-steps\":\"$VQVAE_STEPS\",\"num-images\":\"$NUM_IMAGES\",\"sagemaker_program\":\"train.py\",\"sagemaker_submit_directory\":\"s3://${BUCKET}/code/sourcedir.tar.gz\"}"
 
           aws sagemaker create-training-job \
             --training-job-name "$JOB_NAME" \

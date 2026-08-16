@@ -441,6 +441,15 @@ aws sagemaker-runtime invoke-endpoint \
 - **Examples are stored as `array.array('i')`, not Python lists.** Across the
   full 25k traces that is ~0.11GB instead of ~0.93GB — Python boxes every token
   id above 255 as a separate object, which adds up over 12.8M tokens.
+- **`--seq-len` is a truncation cap, not the context window.** The context
+  window is `n_positions=1024`, fixed by the checkpoint. `seq-len` only decides
+  where long conversations get cut. It defaults to 1024 because raising it is
+  effectively free — `make_batch` pads to the longest example *in each batch*,
+  not to `seq-len`, so an unused cap costs nothing. Measured on the Mythos
+  traces: mean 457 tokens, max 549. A 512 cap truncated 21% of conversations,
+  and truncation removes the *tail* of the assistant's answer — the `<|im_end|>`
+  token that teaches the model to stop. The training log prints the exact
+  truncation count, so check it if you change either number.
 - **No `learned_params.json` for v5.** v3 dumps its weights as JSON; the same
   dump for 355M floats is roughly 7GB and would make `model.tar.gz` unusable.
 - **tiktoken's BPE cache is bundled** into `model.tar.gz/code/tiktoken_cache/`,

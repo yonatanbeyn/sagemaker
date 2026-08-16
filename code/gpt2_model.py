@@ -20,9 +20,10 @@ matching what GPT-2 actually used —
 Module names deliberately mirror the HuggingFace state_dict layout
 (`transformer.h.0.attn.c_attn.weight`) so the checkpoint drops in key-for-key.
 
-Dependencies: torch only. `transformers` is a TRAINING-time dependency (used
-once to fetch the base checkpoint) and is deliberately NOT imported here, so
-the inference container stays lean.
+Dependencies: torch only — not even `transformers`. load_hf_state_dict() takes
+a plain dict, so the caller decides how the tensors were read (train_v5.py
+reads model.safetensors directly). That keeps this module usable in the
+inference container, which installs nothing but tiktoken.
 """
 
 import torch
@@ -208,26 +209,50 @@ NEEDS_TRANSPOSE = (
 SKIP_SUFFIXES = (".attn.bias", ".attn.masked_bias")
 
 
+def normalize_gpt2_key(key):
+    """
+    Map a checkpoint key onto our module layout.
+
+    Two layouts exist in the wild and we accept both:
+      - GPT2LMHeadModel.state_dict()  ->  "transformer.h.0.attn.c_attn.weight"
+      - the Hub's model.safetensors   ->  "h.0.attn.c_attn.weight"
+    The Hub files for gpt2/gpt2-medium/... were saved from the BASE GPT2Model,
+    so they carry no "transformer." prefix (verified against the published
+    gpt2-medium safetensors header: 316 tensors, none prefixed).
+    """
+    if key.startswith("transformer.") or key == "lm_head.weight":
+        return key
+    return "transformer." + key
+
+
 def load_hf_state_dict(model, hf_sd):
     """
-    Copy a HuggingFace GPT2LMHeadModel state_dict into a GPT2 instance.
+    Copy a HuggingFace GPT-2 state_dict into a GPT2 instance.
 
-    Takes a plain dict so this module never has to import `transformers`.
+    Takes a plain dict, so this module never imports `transformers` or
+    `safetensors` — the caller decides how the tensors were read.
     Returns (copied, transposed, skipped) counts for logging.
     """
     our_sd = model.state_dict()
     copied = transposed = skipped = 0
+    seen = set()
 
     with torch.no_grad():
-        for key, tensor in hf_sd.items():
-            if key.endswith(SKIP_SUFFIXES):
+        for raw_key, tensor in hf_sd.items():
+            if raw_key.endswith(SKIP_SUFFIXES):
                 skipped += 1
                 continue
-            if key == "lm_head.weight":
+            if raw_key == "lm_head.weight":
                 skipped += 1          # tied to wte.weight; copied along with it
                 continue
+
+            key = normalize_gpt2_key(raw_key)
+            seen.add(key)
             if key not in our_sd:
-                raise KeyError(f"checkpoint key '{key}' has no counterpart in GPT2")
+                raise KeyError(
+                    f"checkpoint key '{raw_key}' (-> '{key}') has no "
+                    f"counterpart in GPT2"
+                )
 
             if key.endswith(NEEDS_TRANSPOSE):
                 tensor = tensor.t()
@@ -241,7 +266,10 @@ def load_hf_state_dict(model, hf_sd):
             our_sd[key].copy_(tensor)
             copied += 1
 
-    missing = [k for k in our_sd if k not in hf_sd and k != "lm_head.weight"]
+    # Every parameter must have received a pretrained value. Without this a
+    # silently renamed key would leave part of the model randomly initialised
+    # and the failure would only show up as mediocre output.
+    missing = [k for k in our_sd if k not in seen and k != "lm_head.weight"]
     if missing:
         raise RuntimeError(f"these parameters got no pretrained values: {missing}")
 

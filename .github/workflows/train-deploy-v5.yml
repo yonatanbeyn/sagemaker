@@ -58,7 +58,9 @@ env:
   PROJECT_NAME:    tiny-transformer-v5
   STACK_NAME:      tiny-transformer-stack
   S3_PREFIX:       v5
-  # A10G (g5) and T4 (g4dn) both work with this cu121 image.
+  # A10G (g5) and T4 (g4dn) both work with this cu121 image. It ships torch
+  # 2.1.0; train_v5.py deliberately avoids `transformers` so nothing in the
+  # source dir is coupled to that torch version (see requirements-v5.txt).
   TRAINING_IMAGE:  763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker
   INFERENCE_IMAGE: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker
   ENDPOINT_INSTANCE: ml.m5.xlarge
@@ -120,8 +122,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Staging only calls snapshot_download() and load_dataset() — transformers
+      # is not used on the runner at all, only inside the training container.
       - name: Install staging dependencies
-        run: pip install --quiet "huggingface_hub>=0.20" "datasets>=2.14" "transformers>=4.36,<5"
+        run: pip install --quiet "huggingface_hub>=0.20" "datasets>=2.14,<3"
 
       # Stage the pretrained base model to S3 so the training job needs no
       # internet egress. Skipped when the weights are already in the bucket —
@@ -265,7 +269,7 @@ jobs:
               "batch-size":    "${{ steps.params.outputs.batch_size }}",
               "grad-accum":    "${{ steps.params.outputs.grad_accum }}",
               "lr":            "${{ steps.params.outputs.lr }}",
-              "seq-len":       "512",
+              "seq-len":       "1024",
               "precision":     "auto",
               "sagemaker_program":          "train_v5.py",
               "sagemaker_submit_directory": "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"

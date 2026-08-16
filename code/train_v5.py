@@ -58,7 +58,16 @@ parser.add_argument("--dataset", type=str, default="ansulev/claude-mythos-distil
                     help="HF dataset id, used only if the training channel is absent")
 parser.add_argument("--dataset-split", type=str, default="train",
                     help="full 25k traces by default; slice with e.g. train[:2000]")
-parser.add_argument("--seq-len", type=int, default=512)
+# Truncation cap for a single training example — NOT the model's context window
+# (that is n_positions=1024, fixed by the checkpoint, and validated below).
+#
+# Set to GPT-2's maximum because it is effectively free: make_batch pads to the
+# longest example IN EACH BATCH, not to seq_len, so an unused cap costs nothing.
+# Measured on the Mythos traces: mean 457 tokens, max 549. A 512 cap truncated
+# 21% of conversations — and truncation removes the TAIL of the assistant's
+# answer, i.e. the <|im_end|> token that teaches the model to stop. Cheap to
+# avoid entirely.
+parser.add_argument("--seq-len", type=int, default=1024)
 parser.add_argument("--batch-size", type=int, default=4)
 parser.add_argument("--grad-accum", type=int, default=4)
 # 3200 steps x 16 examples = 51,200 examples ~= 2 epochs over the full 25k set.
@@ -155,11 +164,49 @@ vocab_size = enc.n_vocab    # 50257
 # ── 1. Load the pretrained GPT-2 base ────────────────────────────────────────
 print("\n[1/5] Loading pretrained GPT-2 base ...")
 
-try:
-    from transformers import GPT2LMHeadModel
-except ImportError:
-    raise SystemExit("transformers is required at training time. "
-                     "Check requirements.txt in the source dir.")
+class BaseConfig:
+    """The five fields we need out of a GPT-2 config.json."""
+
+    def __init__(self, d):
+        self.n_layer = d["n_layer"]
+        self.n_embd = d["n_embd"]
+        self.n_head = d["n_head"]
+        self.n_positions = d["n_positions"]
+        self.vocab_size = d["vocab_size"]
+
+
+def read_base_checkpoint(source):
+    """
+    Read config.json + model.safetensors, either from a local directory (the
+    S3-staged channel) or from the HF Hub.
+
+    Deliberately does NOT use `transformers`. All we ever needed from it was a
+    state dict, and importing it coupled this container to the library's torch
+    expectations: transformers >= ~4.56 calls torch 2.2's
+    torch.utils._pytree.register_pytree_node, which does not exist on the
+    PyTorch 2.1 DLC, so the job died at import before training started.
+    safetensors has no such coupling.
+    """
+    if os.path.isdir(source):
+        cfg_path = os.path.join(source, "config.json")
+        wt_path = os.path.join(source, "model.safetensors")
+        for p in (cfg_path, wt_path):
+            if not os.path.exists(p):
+                raise FileNotFoundError(
+                    f"{p} missing — the basemodel channel must contain "
+                    f"config.json and model.safetensors"
+                )
+    else:
+        from huggingface_hub import hf_hub_download
+        cfg_path = hf_hub_download(source, "config.json")
+        wt_path = hf_hub_download(source, "model.safetensors")
+
+    from safetensors.torch import load_file
+
+    with open(cfg_path) as f:
+        cfg_dict = json.load(f)
+    return BaseConfig(cfg_dict), load_file(wt_path)
+
 
 if SM_CHANNEL_BASEMODEL and os.path.isdir(SM_CHANNEL_BASEMODEL) and os.listdir(SM_CHANNEL_BASEMODEL):
     base_source = SM_CHANNEL_BASEMODEL
@@ -169,10 +216,10 @@ else:
     base_source = args.base_model
     print(f"  No basemodel channel — downloading '{base_source}' from the HF Hub")
 
-hf_model = GPT2LMHeadModel.from_pretrained(base_source)
-cfg = hf_model.config
+cfg, base_sd = read_base_checkpoint(base_source)
 print(f"  Config: n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_head={cfg.n_head} "
       f"n_positions={cfg.n_positions} vocab={cfg.vocab_size}")
+print(f"  Checkpoint tensors: {len(base_sd)}")
 
 if cfg.vocab_size != vocab_size:
     raise ValueError(f"tokenizer vocab {vocab_size} != checkpoint vocab {cfg.vocab_size}")
@@ -188,8 +235,8 @@ model = GPT2(
     n_head=cfg.n_head,
 )
 
-copied, transposed, skipped = load_hf_state_dict(model, hf_model.state_dict())
-del hf_model
+copied, transposed, skipped = load_hf_state_dict(model, base_sd)
+del base_sd
 print(f"  Copied {copied} tensors ({transposed} transposed from HF's Conv1D "
       f"layout), skipped {skipped} (tied/buffers)")
 
@@ -645,8 +692,9 @@ for fname in ["inference_v5.py", "gpt2_model.py"]:
     print(f"  Bundled {fname} → code/{fname}")
 
 # Serving needs only tiktoken on top of the container's torch. Deliberately not
-# reusing the training requirements — transformers and datasets are ~1GB of
-# dependencies the endpoint would install on every cold start and never use.
+# reusing the training requirements — safetensors, huggingface_hub and datasets
+# are only needed to READ the base checkpoint and the traces, which serving
+# never does, and the endpoint would reinstall them on every cold start.
 with open(os.path.join(code_dir, "requirements.txt"), "w") as f:
     f.write("tiktoken>=0.5.0\n")
 print(f"  Wrote serving requirements.txt (tiktoken only)")

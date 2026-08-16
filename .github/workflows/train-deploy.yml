@@ -4,12 +4,29 @@ name: Train and Deploy TinyTransformer
 # Runs automatically on push to main branch.
 # Can also be triggered manually from the GitHub Actions UI.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "code/**"                  # only run when training code changes
-      - "data/**"                  # or when training data changes
-      - ".github/workflows/train-deploy.yml"
+  # ── AUTO-TRIGGER DISABLED ────────────────────────────────────────────────
+  # v5 is the active pipeline; v3 is kept for comparison and rollback. The
+  # push trigger below matched "code/**", so every v5 change also started a
+  # full v3 retrain (60,000 steps) and redeployed the v3 endpoint for nothing.
+  #
+  # v3 still runs on demand: Actions → "Train and Deploy TinyTransformer" →
+  # Run workflow (workflow_dispatch, below).
+  #
+  # To re-enable auto-training, uncomment this block. Keep the "!code/*_v5"
+  # exclusions — without them "code/**" matches the v5 files and both
+  # pipelines fire on a v5-only push.
+  #
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "code/**"                  # only run when training code changes
+  #     - "data/**"                  # or when training data changes
+  #     - ".github/workflows/train-deploy.yml"
+  #     - "!code/train_v5.py"
+  #     - "!code/inference_v5.py"
+  #     - "!code/gpt2_model.py"
+  #     - "!code/requirements-v5.txt"
+
   workflow_dispatch:               # manual trigger
     inputs:
       steps:

@@ -1,0 +1,543 @@
+name: Train and Deploy v5 (GPT-2 + Mythos SFT)
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+# Runs on push to main when any v5 file changes, or manually from the Actions UI.
+# The v3 pipeline in train-deploy.yml is untouched and triggers independently.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "code/train_v5.py"
+      - "code/inference_v5.py"
+      - "code/gpt2_model.py"
+      - "code/requirements-v5.txt"
+      - ".github/workflows/train-deploy-v5.yml"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "Optimizer steps (3200 = ~2 epochs over the full 25k)"
+        required: false
+        default: "3200"
+      base_model:
+        description: "Base checkpoint (gpt2 | gpt2-medium | gpt2-large)"
+        required: false
+        default: "gpt2-medium"
+      dataset_split:
+        description: "HF dataset split — 'train' is all 25k traces"
+        required: false
+        default: "train"
+      batch_size:
+        description: "Micro-batch size"
+        required: false
+        default: "4"
+      grad_accum:
+        description: "Gradient accumulation steps"
+        required: false
+        default: "4"
+      lr:
+        description: "Learning rate"
+        required: false
+        default: "3e-5"
+      training_instance:
+        description: "Training instance type"
+        required: false
+        default: "ml.g5.xlarge"
+      skip_deploy:
+        description: "Train and register only, do not touch the endpoint"
+        required: false
+        default: "false"
+
+# ── Permissions — required for OIDC token exchange ────────────────────────────
+permissions:
+  id-token: write
+  contents: read
+
+# ── Environment ───────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:      us-east-1
+  PROJECT_NAME:    tiny-transformer-v5
+  STACK_NAME:      tiny-transformer-stack
+  S3_PREFIX:       v5
+  # A10G (g5) and T4 (g4dn) both work with this cu121 image.
+  TRAINING_IMAGE:  763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker
+  INFERENCE_IMAGE: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.1.0-cpu-py310-ubuntu20.04-sagemaker
+  ENDPOINT_INSTANCE: ml.m5.xlarge
+
+jobs:
+
+  # ── Job 1: Stage artifacts + train ──────────────────────────────────────────
+  train:
+    name: SageMaker Training Job (v5)
+    runs-on: ubuntu-latest
+
+    outputs:
+      model_s3_uri: ${{ steps.model_uri.outputs.model_s3_uri }}
+      job_name:     ${{ steps.training.outputs.job_name }}
+      base_model:   ${{ steps.params.outputs.base_model }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Resolve run parameters
+        id: params
+        run: |
+          set -euo pipefail
+          {
+            echo "steps=${{ github.event.inputs.steps || '3200' }}"
+            echo "base_model=${{ github.event.inputs.base_model || 'gpt2-medium' }}"
+            echo "dataset_split=${{ github.event.inputs.dataset_split || 'train' }}"
+            echo "batch_size=${{ github.event.inputs.batch_size || '4' }}"
+            echo "grad_accum=${{ github.event.inputs.grad_accum || '4' }}"
+            echo "lr=${{ github.event.inputs.lr || '3e-5' }}"
+            echo "instance=${{ github.event.inputs.training_instance || 'ml.g5.xlarge' }}"
+          } >> $GITHUB_OUTPUT
+
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          set -euo pipefail
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "bucket=$BUCKET"     >> $GITHUB_OUTPUT
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "Bucket: $BUCKET"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install staging dependencies
+        run: pip install --quiet "huggingface_hub>=0.20" "datasets>=2.14" "transformers>=4.36,<5"
+
+      # Stage the pretrained base model to S3 so the training job needs no
+      # internet egress. Skipped when the weights are already in the bucket —
+      # this is the slow part (~1.4GB for gpt2-medium) and it never changes.
+      - name: Stage base model to S3
+        id: basemodel
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          BASE_MODEL="${{ steps.params.outputs.base_model }}"
+          DEST="s3://${BUCKET}/${S3_PREFIX}/basemodel/${BASE_MODEL}"
+
+          if aws s3 ls "${DEST}/config.json" >/dev/null 2>&1; then
+            echo "Base model already staged at ${DEST} — skipping download"
+          else
+            echo "Downloading ${BASE_MODEL} from the HuggingFace Hub ..."
+            python3 - <<PY
+          from huggingface_hub import snapshot_download
+          p = snapshot_download(
+              repo_id="${BASE_MODEL}",
+              local_dir="/tmp/basemodel",
+              # Weights only. Tokenizer files are unnecessary — we tokenize with
+              # tiktoken, which uses the identical GPT-2 BPE vocab.
+              allow_patterns=["config.json", "generation_config.json", "model.safetensors"],
+          )
+          print("downloaded to", p)
+          PY
+            ls -la /tmp/basemodel
+            aws s3 sync /tmp/basemodel "$DEST" --only-show-errors
+            echo "Uploaded base model to $DEST"
+          fi
+
+          echo "uri=${DEST}/" >> $GITHUB_OUTPUT
+
+      # Stage the Mythos traces as JSONL. Small (a few MB for a 2k slice), so
+      # this is re-uploaded every run and always reflects the requested split.
+      - name: Stage Mythos dataset to S3
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          SPLIT="${{ steps.params.outputs.dataset_split }}"
+
+          python3 - <<PY
+          import json
+          from datasets import load_dataset
+
+          ds = load_dataset("ansulev/claude-mythos-distilled-25k", split="${SPLIT}")
+          kept = 0
+          with open("/tmp/mythos.jsonl", "w", encoding="utf-8") as f:
+              for row in ds:
+                  msgs = row.get("messages") or []
+                  if not msgs:
+                      continue
+                  # Keep only what training reads; drops id/category/timestamp.
+                  f.write(json.dumps({"messages": msgs}, ensure_ascii=False) + "\n")
+                  kept += 1
+          print(f"wrote {kept} conversations")
+          if kept == 0:
+              raise SystemExit("dataset produced 0 usable conversations")
+          PY
+
+          SIZE=$(wc -c < /tmp/mythos.jsonl)
+          echo "mythos.jsonl: ${SIZE} bytes"
+
+          # The training channel is an S3 prefix, so clear stale slices first —
+          # otherwise a smaller split would silently train on the previous one.
+          aws s3 rm "s3://${BUCKET}/${S3_PREFIX}/data/" --recursive --only-show-errors || true
+          aws s3 cp /tmp/mythos.jsonl "s3://${BUCKET}/${S3_PREFIX}/data/mythos.jsonl"
+
+      # The training toolkit reads sagemaker_submit_directory from the
+      # hyperparameters, downloads this archive, and extracts it to /opt/ml/code.
+      - name: Package and upload training code
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+
+          rm -rf /tmp/sourcedir && mkdir -p /tmp/sourcedir
+          cp code/train_v5.py code/inference_v5.py code/gpt2_model.py /tmp/sourcedir/
+          # The toolkit only ever installs a file literally named requirements.txt.
+          cp code/requirements-v5.txt /tmp/sourcedir/requirements.txt
+
+          tar czf /tmp/sourcedir.tar.gz -C /tmp/sourcedir .
+          aws s3 cp /tmp/sourcedir.tar.gz \
+            "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"
+          tar tzf /tmp/sourcedir.tar.gz
+
+      - name: Start SageMaker Training Job
+        id: training
+        run: |
+          set -euo pipefail
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          JOB_NAME="${PROJECT_NAME}-${TIMESTAMP}"
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          # Built as JSON rather than CLI shorthand: the request carries nested
+          # MetricDefinitions and two input channels, which the backslash-
+          # continuation shorthand handles very badly.
+          cat > /tmp/job.json <<JSON
+          {
+            "TrainingJobName": "${JOB_NAME}",
+            "RoleArn": "${ROLE_ARN}",
+            "AlgorithmSpecification": {
+              "TrainingImage": "${TRAINING_IMAGE}",
+              "TrainingInputMode": "File",
+              "MetricDefinitions": [
+                {"Name": "train:loss",      "Regex": "train_loss=([0-9\\\\.]+)"},
+                {"Name": "validation:loss", "Regex": "val_loss=([0-9\\\\.]+)"},
+                {"Name": "grad:norm",       "Regex": "grad_norm=([0-9\\\\.]+)"}
+              ]
+            },
+            "InputDataConfig": [
+              {
+                "ChannelName": "training",
+                "DataSource": {"S3DataSource": {
+                  "S3DataType": "S3Prefix",
+                  "S3Uri": "s3://${BUCKET}/${S3_PREFIX}/data/",
+                  "S3DataDistributionType": "FullyReplicated"
+                }}
+              },
+              {
+                "ChannelName": "basemodel",
+                "DataSource": {"S3DataSource": {
+                  "S3DataType": "S3Prefix",
+                  "S3Uri": "${{ steps.basemodel.outputs.uri }}",
+                  "S3DataDistributionType": "FullyReplicated"
+                }}
+              }
+            ],
+            "OutputDataConfig": {"S3OutputPath": "s3://${BUCKET}/${S3_PREFIX}/models/"},
+            "ResourceConfig": {
+              "InstanceType": "${{ steps.params.outputs.instance }}",
+              "InstanceCount": 1,
+              "VolumeSizeInGB": 50
+            },
+            "StoppingCondition": {"MaxRuntimeInSeconds": 14400},
+            "HyperParameters": {
+              "base-model":    "${{ steps.params.outputs.base_model }}",
+              "dataset-split": "${{ steps.params.outputs.dataset_split }}",
+              "steps":         "${{ steps.params.outputs.steps }}",
+              "batch-size":    "${{ steps.params.outputs.batch_size }}",
+              "grad-accum":    "${{ steps.params.outputs.grad_accum }}",
+              "lr":            "${{ steps.params.outputs.lr }}",
+              "seq-len":       "512",
+              "precision":     "auto",
+              "sagemaker_program":          "train_v5.py",
+              "sagemaker_submit_directory": "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"
+            },
+            "Tags": [
+              {"Key": "Project", "Value": "${PROJECT_NAME}"},
+              {"Key": "Commit",  "Value": "${{ github.sha }}"}
+            ]
+          }
+          JSON
+
+          python3 -c "import json;json.load(open('/tmp/job.json'))" && echo "job.json is valid JSON"
+          aws sagemaker create-training-job --cli-input-json file:///tmp/job.json
+
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "Started training job: $JOB_NAME"
+          echo "Logs: https://console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#logsV2:log-groups/log-group/\$252Faws\$252Fsagemaker\$252FTrainingJobs"
+
+      # Fine-tuning 355M params takes ~35-70 min depending on instance, so this
+      # polls far longer than the v3 pipeline's 55 minutes.
+      - name: Wait for training to complete
+        timeout-minutes: 250
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          echo "Waiting for $JOB_NAME ..."
+
+          for i in $(seq 1 240); do
+            STATUS=$(aws sagemaker describe-training-job \
+              --training-job-name "$JOB_NAME" \
+              --query "TrainingJobStatus" --output text)
+            SECONDARY=$(aws sagemaker describe-training-job \
+              --training-job-name "$JOB_NAME" \
+              --query "SecondaryStatus" --output text)
+            echo "  [${i}m] $STATUS / $SECONDARY"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "Training completed."
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Stopped" ]; then
+              REASON=$(aws sagemaker describe-training-job \
+                --training-job-name "$JOB_NAME" \
+                --query "FailureReason" --output text)
+              echo "::error::Training $STATUS — $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+          echo "::error::Timed out after 240 minutes waiting for $JOB_NAME"
+          exit 1
+
+      - name: Get model S3 URI and final metrics
+        id: model_uri
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          MODEL_URI=$(aws sagemaker describe-training-job \
+            --training-job-name "$JOB_NAME" \
+            --query "ModelArtifacts.S3ModelArtifacts" --output text)
+          echo "model_s3_uri=$MODEL_URI" >> $GITHUB_OUTPUT
+
+          echo "### v5 training complete"           >> $GITHUB_STEP_SUMMARY
+          echo ""                                    >> $GITHUB_STEP_SUMMARY
+          echo "| field | value |"                   >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"                           >> $GITHUB_STEP_SUMMARY
+          echo "| job | \`$JOB_NAME\` |"             >> $GITHUB_STEP_SUMMARY
+          echo "| base | ${{ steps.params.outputs.base_model }} |"  >> $GITHUB_STEP_SUMMARY
+          echo "| steps | ${{ steps.params.outputs.steps }} |"      >> $GITHUB_STEP_SUMMARY
+          echo "| artifact | \`$MODEL_URI\` |"       >> $GITHUB_STEP_SUMMARY
+
+          aws sagemaker describe-training-job --training-job-name "$JOB_NAME" \
+            --query "FinalMetricDataList" --output table || true
+
+  # ── Job 2: Register in the v5 Model Registry group ──────────────────────────
+  register:
+    name: Register v5 Model
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Register model package
+        run: |
+          set -euo pipefail
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          GROUP_NAME="${PROJECT_NAME}-models"
+
+          cat > /tmp/pkg.json <<JSON
+          {
+            "ModelPackageGroupName": "${GROUP_NAME}",
+            "ModelPackageDescription": "v5 ${{ needs.train.outputs.base_model }} Mythos SFT — commit ${{ github.sha }}",
+            "InferenceSpecification": {
+              "Containers": [{
+                "Image": "${INFERENCE_IMAGE}",
+                "ModelDataUrl": "${MODEL_URI}",
+                "Environment": {
+                  "SAGEMAKER_PROGRAM": "inference_v5.py",
+                  "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code"
+                }
+              }],
+              "SupportedContentTypes": ["application/json"],
+              "SupportedResponseMIMETypes": ["application/json"]
+            },
+            "ModelApprovalStatus": "PendingManualApproval"
+          }
+          JSON
+
+          aws sagemaker create-model-package --cli-input-json file:///tmp/pkg.json
+          echo "Registered in $GROUP_NAME — pending manual approval."
+
+  # ── Job 3: Deploy to a dedicated v5 endpoint ────────────────────────────────
+  # Separate endpoint from v3 (tiny-transformer-endpoint), so the two models can
+  # be compared side by side and a bad v5 run cannot take down v3.
+  deploy:
+    name: Deploy v5 Endpoint
+    runs-on: ubuntu-latest
+    needs: [train, register]
+    if: ${{ github.event.inputs.skip_deploy != 'true' }}
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create or update the v5 endpoint
+        run: |
+          set -euo pipefail
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          MODEL_NAME="${PROJECT_NAME}-model-${TIMESTAMP}"
+          CONFIG_NAME="${PROJECT_NAME}-config-${TIMESTAMP}"
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          # SAGEMAKER_MODEL_SERVER_TIMEOUT: CPU generation of 150 tokens through
+          # 24 layers takes ~10s, comfortably past the 60s default only under
+          # load — but raise it so slow requests return instead of 424-ing.
+          cat > /tmp/model.json <<JSON
+          {
+            "ModelName": "${MODEL_NAME}",
+            "ExecutionRoleArn": "${ROLE_ARN}",
+            "PrimaryContainer": {
+              "Image": "${INFERENCE_IMAGE}",
+              "ModelDataUrl": "${MODEL_URI}",
+              "Environment": {
+                "SAGEMAKER_PROGRAM": "inference_v5.py",
+                "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code",
+                "SAGEMAKER_MODEL_SERVER_TIMEOUT": "180",
+                "SAGEMAKER_CONTAINER_LOG_LEVEL": "20",
+                "TS_DEFAULT_RESPONSE_TIMEOUT": "180"
+              }
+            }
+          }
+          JSON
+          aws sagemaker create-model --cli-input-json file:///tmp/model.json
+
+          # The default 600s startup health check is not enough here: the
+          # container has to pull a ~1.4GB model.tar.gz, pip install tiktoken,
+          # then load 355M fp32 params on CPU.
+          cat > /tmp/config.json <<JSON
+          {
+            "EndpointConfigName": "${CONFIG_NAME}",
+            "ProductionVariants": [{
+              "VariantName": "AllTraffic",
+              "ModelName": "${MODEL_NAME}",
+              "InitialInstanceCount": 1,
+              "InstanceType": "${ENDPOINT_INSTANCE}",
+              "InitialVariantWeight": 1,
+              "ModelDataDownloadTimeoutInSeconds": 1800,
+              "ContainerStartupHealthCheckTimeoutInSeconds": 1800
+            }]
+          }
+          JSON
+          aws sagemaker create-endpoint-config --cli-input-json file:///tmp/config.json
+
+          STATUS=$(aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" \
+            --query "EndpointStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Creating endpoint: $ENDPOINT_NAME"
+            aws sagemaker create-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          else
+            echo "Updating endpoint: $ENDPOINT_NAME (was $STATUS)"
+            aws sagemaker update-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          fi
+
+      - name: Wait for endpoint to be InService
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+
+          for i in $(seq 1 40); do
+            STATUS=$(aws sagemaker describe-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --query "EndpointStatus" --output text)
+            echo "  [${i}m] $STATUS"
+
+            if [ "$STATUS" = "InService" ]; then
+              echo "Endpoint is live."
+              exit 0
+            elif [ "$STATUS" = "Failed" ]; then
+              REASON=$(aws sagemaker describe-endpoint \
+                --endpoint-name "$ENDPOINT_NAME" \
+                --query "FailureReason" --output text)
+              echo "::error::Endpoint failed — $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+          echo "::error::Timed out waiting for $ENDPOINT_NAME"
+          exit 1
+
+      - name: Smoke test endpoint
+        run: |
+          set -euo pipefail
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+
+          aws sagemaker-runtime invoke-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION" \
+            --content-type "application/json" \
+            --cli-binary-format raw-in-base64-out \
+            --body '{"prompt":"Explain how multi-head attention distributes work across heads.","max_tokens":80,"temperature":0.8}' \
+            /tmp/smoke.json
+
+          echo "Response:"
+          cat /tmp/smoke.json
+
+          # An empty completion means the model loaded but generation is broken
+          # (bad template, immediate EOS) — the endpoint would look healthy.
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("/tmp/smoke.json"))
+          text = r.get("generated_text", "")
+          print(f"\ntokens_generated={r.get('tokens_generated')} "
+                f"stop_reason={r.get('stop_reason')}")
+          if not text.strip():
+              sys.exit("smoke test produced an empty completion")
+          print("Smoke test passed.")
+          PY
+
+          {
+            echo "### v5 endpoint live"
+            echo ""
+            echo "\`$ENDPOINT_NAME\` on \`${{ env.ENDPOINT_INSTANCE }}\`"
+            echo ""
+            echo '```json'
+            cat /tmp/smoke.json
+            echo ""
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY

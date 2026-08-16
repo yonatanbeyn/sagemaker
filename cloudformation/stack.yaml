@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  TinyTransformer v3 — SageMaker MLOps stack.
-  Provisions: S3 bucket, IAM roles, SageMaker Model Package Group,
-  and all permissions needed for the GitHub Actions CI/CD pipeline.
+  TinyTransformer — SageMaker MLOps stack (v3 + v5).
+  Provisions: S3 bucket, IAM roles, SageMaker Model Package Groups,
+  and all permissions needed for the GitHub Actions CI/CD pipelines.
+  v3 = 26M TinyTransformer trained from scratch.
+  v5 = 355M gpt2-medium fine-tuned on Claude Mythos reasoning traces.
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 Parameters:
@@ -32,17 +34,24 @@ Parameters:
       - ml.m5.large
       - ml.m5.xlarge
       - ml.c5.xlarge
-      - ml.g4dn.xlarge   # GPU — faster training
+      - ml.g4dn.xlarge   # T4 16GB  — v5 fine-tuning in fp16
+      - ml.g5.xlarge     # A10G 24GB — v5 fine-tuning in bf16 (recommended)
+      - ml.g5.2xlarge    # A10G 24GB, more vCPU for data collation
     Description: SageMaker Training Job instance type
 
   EndpointInstanceType:
     Type: String
     Default: ml.t2.medium
     AllowedValues:
-      - ml.t2.medium
-      - ml.m5.large
+      - ml.t2.medium     # 4GB  — v3 only. Too small for the 355M v5 model.
+      - ml.m5.large      # 8GB
       - ml.c5.large
-    Description: SageMaker Endpoint instance type
+      - ml.m5.xlarge     # 16GB — v5 CPU serving (recommended)
+      - ml.g4dn.xlarge   # T4   — v5 GPU serving, ~30x faster generation
+    Description: >
+      SageMaker Endpoint instance type. The v5 model is 355M fp32 params
+      (~1.4GB of weights before activations), so it needs ml.m5.xlarge or
+      larger — ml.t2.medium will OOM.
 
 # ── Resources ─────────────────────────────────────────────────────────────────
 Resources:
@@ -183,11 +192,16 @@ Resources:
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: !GetAtt SageMakerRole.Arn
-              # S3 — upload training data and read model artifacts
+              # S3 — upload training data and read model artifacts.
+              # DeleteObject is required by the v5 workflow, which clears the
+              # dataset prefix before uploading a new split (the training
+              # channel is an S3 prefix, so a stale larger slice left behind
+              # would silently be fed to the job alongside the new one).
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
+                  - s3:DeleteObject
                   - s3:ListBucket
                 Resource:
                   - !Sub "arn:aws:s3:::${ModelBucket}"
@@ -229,6 +243,17 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
+  # Separate group for v5 so the two model lineages are versioned and approved
+  # independently — a v5 regression should never block a v3 rollback.
+  ModelPackageGroupV5:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !Sub "${ProjectName}-v5-models"
+      ModelPackageGroupDescription: "v5 — gpt2-medium fine-tuned on Claude Mythos reasoning traces"
+      Tags:
+        - Key: Project
+          Value: !Sub "${ProjectName}-v5"
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 # These values are referenced by the GitHub Actions workflow.
 Outputs:
@@ -252,7 +277,13 @@ Outputs:
       Name: !Sub "${ProjectName}-github-actions-role-arn"
 
   ModelPackageGroupName:
-    Description: SageMaker Model Registry group name
+    Description: SageMaker Model Registry group name (v3)
     Value: !Ref ModelPackageGroup
     Export:
       Name: !Sub "${ProjectName}-model-package-group"
+
+  ModelPackageGroupNameV5:
+    Description: SageMaker Model Registry group name (v5 GPT-2 Mythos SFT)
+    Value: !Ref ModelPackageGroupV5
+    Export:
+      Name: !Sub "${ProjectName}-v5-model-package-group"

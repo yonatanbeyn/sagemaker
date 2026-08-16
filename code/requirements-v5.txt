@@ -1,0 +1,15 @@
+# Training-time dependencies for the v5 pipeline (train_v5.py).
+#
+# The GitHub Actions workflow copies this file into the SageMaker source dir as
+# requirements.txt, and the training toolkit pip-installs it before running the
+# entry point.
+#
+# NOTE: this is deliberately NOT what the endpoint installs. train_v5.py writes
+# a minimal requirements.txt (tiktoken only) into model.tar.gz/code/, because
+# transformers + datasets are ~1GB of dependencies that serving never uses and
+# would re-install on every endpoint cold start.
+
+torch>=2.0.0            # already present in the DLC; listed so local runs work
+tiktoken>=0.5.0         # GPT-2 BPE — same vocab as the checkpoint
+transformers>=4.36,<5   # used ONCE, to read the pretrained gpt2-medium weights
+datasets>=2.14.0        # only used if the S3 training channel is missing

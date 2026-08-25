@@ -27,6 +27,7 @@ import argparse
 import array
 import contextlib
 import glob
+import hashlib
 import json
 import math
 import os
@@ -70,9 +71,13 @@ parser.add_argument("--dataset-split", type=str, default="train",
 parser.add_argument("--seq-len", type=int, default=1024)
 parser.add_argument("--batch-size", type=int, default=4)
 parser.add_argument("--grad-accum", type=int, default=4)
-# 3200 steps x 16 examples = 51,200 examples ~= 2 epochs over the full 25k set.
-# 2-3 epochs is the usual SFT range; more starts memorising the traces.
-parser.add_argument("--steps", type=int, default=3200)
+# Lowered from 3200 after the first full run memorised the corpus (train and
+# val loss both collapsed to 0.008, perplexity 1.0, and generations ignored the
+# prompt). 3200 steps x 16 = 51,200 examples looked like 2 epochs over 25k rows,
+# but only ~32% of rows are unique, so it was really ~6.4 passes over the
+# distinct content. 600 steps x 16 = 9,600 is roughly one pass over the deduped
+# set. Watch the "Coverage" line this script prints — that is the real number.
+parser.add_argument("--steps", type=int, default=600)
 parser.add_argument("--lr", type=float, default=3e-5)
 parser.add_argument("--min-lr-frac", type=float, default=0.1)
 parser.add_argument("--warmup-steps", type=int, default=100)
@@ -80,6 +85,26 @@ parser.add_argument("--weight-decay", type=float, default=0.01)
 parser.add_argument("--grad-clip", type=float, default=1.0)
 parser.add_argument("--precision", type=str, default="auto",
                     choices=["auto", "bf16", "fp16", "fp32"])
+
+
+def _bool(v):
+    """SageMaker passes every hyperparameter as a string, so "false" must not
+    become True the way bool("false") does."""
+    return str(v).strip().lower() in ("1", "true", "yes", "y")
+
+
+# "answer" is the default because conversation-level dedup barely helps here.
+# Measured on 500 Mythos rows: 429 unique conversations (14% removed) but only
+# 160 unique ANSWERS, with 101 of them reached by more than one distinct
+# question — one answer is shared by 11 different questions. Keeping those
+# rows teaches the model that the answer does not depend on the question,
+# which is precisely how the first run behaved.
+parser.add_argument("--dedupe-by", type=str, default="answer",
+                    choices=["answer", "conversation", "none"],
+                    help="answer: one row per distinct assistant answer (~68%% "
+                         "removed); conversation: exact-duplicate rows only (~14%%)")
+parser.add_argument("--strip-boilerplate", type=_bool, default=True,
+                    help="remove the fixed preamble shared by nearly every answer")
 parser.add_argument("--val-fraction", type=float, default=0.05)
 parser.add_argument("--eval-interval", type=int, default=200)
 parser.add_argument("--eval-batches", type=int, default=20)
@@ -304,6 +329,49 @@ else:
     print(f"  Loaded {len(raw_rows):,} conversations from '{args.dataset}'")
 
 
+def detect_boilerplate(answers, min_frac=0.8, min_chars=40, probe_len=None):
+    """
+    Find a leading string shared by most assistant answers, so it can be
+    stripped before training.
+
+    The Mythos traces open every answer with the same 55-token incantation
+    ("Drawing from the autonomous, frontier-level reasoning characteristic of
+    Claude Mythos..."). That is 14% of every supervised answer spent teaching
+    the model to recite a constant, and it is a large part of why the first run
+    drove loss to 0.008 while learning nothing about the questions.
+
+    A plain longest-common-prefix over all answers is too brittle — one
+    non-conforming answer collapses it to "". So: take the most common
+    `probe_len`-char opening, require it to cover `min_frac` of answers, then
+    extend it to the exact common prefix of just that majority group.
+    Returns "" when no dominant preamble exists, which is the safe no-op.
+
+    probe_len defaults to min_chars, and must never exceed it. The probe only
+    has to identify the majority group — commonprefix recovers the real length
+    afterwards. Any probe LONGER than the preamble silently fails, because the
+    window spills into per-answer text and no single opening reaches min_frac.
+    Since a prefix shorter than min_chars would be rejected anyway, min_chars
+    is the largest safe probe.
+    """
+    from collections import Counter
+
+    if probe_len is None:
+        probe_len = min_chars
+    probe_len = min(probe_len, min_chars)
+
+    usable = [a for a in answers if len(a) >= probe_len]
+    if not usable:
+        return ""
+
+    candidate, hits = Counter(a[:probe_len] for a in usable).most_common(1)[0]
+    if hits / len(usable) < min_frac:
+        return ""
+
+    group = [a for a in usable if a.startswith(candidate)]
+    prefix = os.path.commonprefix(group)
+    return prefix if len(prefix) >= min_chars else ""
+
+
 def encode_conversation(messages):
     """
     Turn one conversation into (input_ids, labels).
@@ -320,6 +388,13 @@ def encode_conversation(messages):
         if not content:
             continue
 
+        # Strip the shared preamble so supervision goes on the answer, not on
+        # reciting a constant. Only ever removed from assistant turns.
+        if BOILERPLATE and role == "assistant" and content.startswith(BOILERPLATE):
+            content = content[len(BOILERPLATE):].lstrip()
+            if not content:
+                continue
+
         header = enc.encode(f"{IM_START}{role}\n")
         body = enc.encode(content)
         footer = enc.encode(f"{IM_END}\n")
@@ -334,6 +409,67 @@ def encode_conversation(messages):
     labels.append(EOS_ID if any(l != -100 for l in labels) else -100)
     return ids, labels
 
+
+# ── Clean the corpus before encoding ────────────────────────────────────────
+# Both steps exist because of what the first full run produced: a model that
+# recited the Mythos preamble and then answered a different question entirely.
+raw_count = len(raw_rows)
+
+def _dedupe_key(msgs, mode):
+    """
+    'conversation' hashes the whole exchange, so it only catches rows that are
+    identical in both question AND answer.
+    'answer' hashes just the assistant turns, keeping ONE row per distinct
+    answer. That is the one that matters here: many different questions in this
+    corpus share a single answer, and keeping them all is direct supervision
+    for "ignore the question".
+    """
+    if mode == "conversation":
+        payload = json.dumps(msgs, sort_keys=True, ensure_ascii=False)
+    else:
+        payload = "\x00".join(
+            (m.get("content") or m.get("value") or "")
+            for m in msgs
+            if (m.get("role") or m.get("from")) == "assistant"
+        )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+if args.dedupe_by != "none":
+    seen_keys, unique_rows = set(), []
+    for row in raw_rows:
+        msgs = row.get("messages") or row.get("conversations") or []
+        key = _dedupe_key(msgs, args.dedupe_by)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_rows.append(row)
+    dupes = raw_count - len(unique_rows)
+    raw_rows = unique_rows
+    print(f"  Dedupe ({args.dedupe_by:<12}): dropped {dupes:,} rows "
+          f"({100 * dupes / max(raw_count, 1):.1f}%), {len(raw_rows):,} remain")
+else:
+    print("  Dedupe            : disabled")
+
+BOILERPLATE = ""
+if args.strip_boilerplate:
+    all_answers = [
+        m.get("content") or ""
+        for row in raw_rows
+        for m in (row.get("messages") or row.get("conversations") or [])
+        if (m.get("role") or m.get("from")) == "assistant" and (m.get("content") or m.get("value"))
+    ]
+    BOILERPLATE = detect_boilerplate(all_answers)
+    if BOILERPLATE:
+        share = sum(1 for a in all_answers if a.startswith(BOILERPLATE))
+        print(f"  Boilerplate       : stripping {len(enc.encode(BOILERPLATE))} tokens "
+              f"present in {share:,}/{len(all_answers):,} answers "
+              f"({100 * share / max(len(all_answers), 1):.0f}%)")
+        print(f"                      {BOILERPLATE[:90]!r}...")
+    else:
+        print("  Boilerplate       : none dominant enough to strip")
+else:
+    print("  Boilerplate       : stripping disabled")
 
 print("  Encoding conversations and masking prompt tokens ...")
 encode_start = time.time()
@@ -644,6 +780,9 @@ metadata = {
         "supervised_tokens": supervised_tokens,
         "planned_epochs": round(planned_epochs, 3),
         "epochs_seen": round(train_sampler.epochs, 3),
+        "rows_before_dedupe": raw_count,
+        "dedupe_by": args.dedupe_by,
+        "boilerplate_stripped_chars": len(BOILERPLATE),
     },
     "base_model_english_loss": round(probe_loss, 4),
     "smoke_test": {

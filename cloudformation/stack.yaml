@@ -146,6 +146,14 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ProjectName}-github-actions-role"
+      # 6 hours (the GitHub Actions job ceiling). The default is 1 hour, which
+      # is shorter than a v5 training run: the workflow polls
+      # DescribeTrainingJob for up to 240 minutes and every call started
+      # failing with ExpiredTokenException once the hour was up — while the
+      # SageMaker job itself carried on training, unaware.
+      # The workflow must request this explicitly via role-duration-seconds;
+      # this property only sets the ceiling.
+      MaxSessionDuration: 21600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:

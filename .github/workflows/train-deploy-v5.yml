@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       steps:
-        description: "Optimizer steps (3200 = ~2 epochs over the full 25k)"
+        description: "Optimizer steps (600 = ~1 epoch over the DEDUPED set)"
         required: false
-        default: "3200"
+        default: "600"
       base_model:
         description: "Base checkpoint (gpt2 | gpt2-medium | gpt2-large)"
         required: false
@@ -86,13 +86,17 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
+          # Default is 1 hour, but this job polls a training run for up to 240
+          # minutes; the credentials expired mid-poll with ExpiredTokenException.
+          # Capped by MaxSessionDuration on the role in cloudformation/stack.yaml.
+          role-duration-seconds: 21600
 
       - name: Resolve run parameters
         id: params
         run: |
           set -euo pipefail
           {
-            echo "steps=${{ github.event.inputs.steps || '3200' }}"
+            echo "steps=${{ github.event.inputs.steps || '600' }}"
             echo "base_model=${{ github.event.inputs.base_model || 'gpt2-medium' }}"
             echo "dataset_split=${{ github.event.inputs.dataset_split || 'train' }}"
             echo "batch_size=${{ github.event.inputs.batch_size || '4' }}"
@@ -270,6 +274,8 @@ jobs:
               "grad-accum":    "${{ steps.params.outputs.grad_accum }}",
               "lr":            "${{ steps.params.outputs.lr }}",
               "seq-len":       "1024",
+              "dedupe-by":     "answer",
+              "strip-boilerplate": "true",
               "precision":     "auto",
               "sagemaker_program":          "train_v5.py",
               "sagemaker_submit_directory": "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"
@@ -356,6 +362,10 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
+          # Default is 1 hour, but this job polls a training run for up to 240
+          # minutes; the credentials expired mid-poll with ExpiredTokenException.
+          # Capped by MaxSessionDuration on the role in cloudformation/stack.yaml.
+          role-duration-seconds: 21600
 
       - name: Register model package
         run: |
@@ -402,6 +412,10 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
+          # Default is 1 hour, but this job polls a training run for up to 240
+          # minutes; the credentials expired mid-poll with ExpiredTokenException.
+          # Capped by MaxSessionDuration on the role in cloudformation/stack.yaml.
+          role-duration-seconds: 21600
 
       - name: Read CloudFormation outputs
         id: cfn

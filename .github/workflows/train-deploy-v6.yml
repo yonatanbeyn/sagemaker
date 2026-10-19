@@ -1,0 +1,546 @@
+name: Train and Deploy v6 (Qwen2.5-7B QLoRA SFT)
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+# Runs on push to main when any v6 file changes, or manually from the Actions UI.
+# The v5 pipeline (train-deploy-v5.yml) is untouched and triggers independently.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "code/train_v6.py"
+      - "code/inference_v6.py"
+      - "code/requirements-v6.txt"
+      - ".github/workflows/train-deploy-v6.yml"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "Optimizer steps (200 = ~1 pass over 8k examples with effective batch 16)"
+        required: false
+        default: "200"
+      base_model:
+        description: "HF base model id (must be a BASE, not Instruct variant)"
+        required: false
+        default: "Qwen/Qwen2.5-7B"
+      dataset:
+        description: "HF dataset id with real CoT traces"
+        required: false
+        default: "Open-Thoughts/Open-Thoughts-Dataset"
+      dataset_split:
+        description: "Dataset slice (e.g. train[:8000])"
+        required: false
+        default: "train[:8000]"
+      lora_rank:
+        description: "LoRA rank (16 = sweet spot; raise to 32 if val loss plateaus)"
+        required: false
+        default: "16"
+      batch_size:
+        description: "Per-device micro-batch size"
+        required: false
+        default: "4"
+      grad_accum:
+        description: "Gradient accumulation steps (effective batch = batch × accum)"
+        required: false
+        default: "4"
+      lr:
+        description: "Peak learning rate"
+        required: false
+        default: "2e-4"
+      seq_len:
+        description: "Max sequence length (2048 fits 85% of Open-Thoughts on A10G)"
+        required: false
+        default: "2048"
+      training_instance:
+        description: "Training instance type (ml.g5.2xlarge recommended for 24GB A10G)"
+        required: false
+        default: "ml.g5.2xlarge"
+      skip_deploy:
+        description: "Train and register only, do not touch the endpoint"
+        required: false
+        default: "false"
+
+# ── Permissions — required for OIDC token exchange ────────────────────────────
+permissions:
+  id-token: write
+  contents: read
+
+# ── Environment ───────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:      us-east-1
+  PROJECT_NAME:    tiny-transformer-v6
+  STACK_NAME:      tiny-transformer-stack
+  S3_PREFIX:       v6
+  # PyTorch 2.3 DLC ships cu121 and is the minimum Unsloth supports reliably.
+  # g5 instances (A10G) expose bfloat16; g4dn (T4) falls back to fp16 —
+  # train_v6.py detects this at runtime via torch.cuda.is_bf16_supported().
+  TRAINING_IMAGE:  763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.3.0-gpu-py311-cu121-ubuntu20.04-sagemaker
+  # v6 serves a 4-bit Qwen model — needs a GPU inference instance.
+  # ml.g5.xlarge (A10G 24GB) is the cheapest option that fits Qwen2.5-7B in
+  # 4-bit (~5GB VRAM) with room for the KV cache at inference time.
+  INFERENCE_IMAGE: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.3.0-gpu-py311-cu121-ubuntu20.04-sagemaker
+  ENDPOINT_INSTANCE: ml.g5.xlarge
+
+jobs:
+
+  # ── Job 1: Stage dataset + train ─────────────────────────────────────────────
+  train:
+    name: SageMaker Training Job (v6)
+    runs-on: ubuntu-latest
+
+    outputs:
+      model_s3_uri: ${{ steps.model_uri.outputs.model_s3_uri }}
+      job_name:     ${{ steps.training.outputs.job_name }}
+      base_model:   ${{ steps.params.outputs.base_model }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+          # 6-hour session: Qwen2.5-7B downloads ~14GB from HF Hub inside the
+          # container, then trains. Total wall time can reach 90-120 min on
+          # ml.g5.2xlarge. Capped by MaxSessionDuration on the role.
+          role-duration-seconds: 21600
+
+      - name: Resolve run parameters
+        id: params
+        run: |
+          set -euo pipefail
+          {
+            echo "steps=${{ github.event.inputs.steps || '200' }}"
+            echo "base_model=${{ github.event.inputs.base_model || 'Qwen/Qwen2.5-7B' }}"
+            echo "dataset=${{ github.event.inputs.dataset || 'Open-Thoughts/Open-Thoughts-Dataset' }}"
+            echo "dataset_split=${{ github.event.inputs.dataset_split || 'train[:8000]' }}"
+            echo "lora_rank=${{ github.event.inputs.lora_rank || '16' }}"
+            echo "batch_size=${{ github.event.inputs.batch_size || '4' }}"
+            echo "grad_accum=${{ github.event.inputs.grad_accum || '4' }}"
+            echo "lr=${{ github.event.inputs.lr || '2e-4' }}"
+            echo "seq_len=${{ github.event.inputs.seq_len || '2048' }}"
+            echo "instance=${{ github.event.inputs.training_instance || 'ml.g5.2xlarge' }}"
+          } >> $GITHUB_OUTPUT
+
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          set -euo pipefail
+          BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+            --output text)
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "bucket=$BUCKET"     >> $GITHUB_OUTPUT
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "Bucket: $BUCKET"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install staging dependencies
+        run: pip install --quiet "datasets>=2.18,<3"
+
+      # Stage the Open-Thoughts dataset as JSONL to the training channel.
+      # Open-Thoughts schema: {system, conversations: [{from, value}]}
+      # train_v6.py's extract_messages() reads this format directly.
+      # The dataset is re-staged each run so the slice is always in sync.
+      - name: Stage Open-Thoughts dataset to S3
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          SPLIT="${{ steps.params.outputs.dataset_split }}"
+
+          python3 - <<PY
+          import json
+          from datasets import load_dataset
+
+          ds = load_dataset("Open-Thoughts/Open-Thoughts-Dataset", split="${SPLIT}")
+          kept = 0
+          with open("/tmp/open_thoughts.jsonl", "w", encoding="utf-8") as f:
+              for row in ds:
+                  convs = row.get("conversations") or []
+                  if not convs:
+                      continue
+                  f.write(json.dumps({
+                      "system": row.get("system", ""),
+                      "conversations": convs,
+                  }, ensure_ascii=False) + "\n")
+                  kept += 1
+          print(f"wrote {kept} conversations")
+          if kept == 0:
+              raise SystemExit("dataset produced 0 usable conversations")
+          PY
+
+          SIZE=$(wc -c < /tmp/open_thoughts.jsonl)
+          echo "open_thoughts.jsonl: ${SIZE} bytes"
+
+          aws s3 rm "s3://${BUCKET}/${S3_PREFIX}/data/" --recursive --only-show-errors || true
+          aws s3 cp /tmp/open_thoughts.jsonl "s3://${BUCKET}/${S3_PREFIX}/data/open_thoughts.jsonl"
+
+      # NOTE: Unlike v5 which staged the base model weights to S3, v6 lets
+      # Unsloth download Qwen2.5-7B from the HF Hub inside the training
+      # container. This means the SageMaker training job needs outbound HTTPS
+      # to huggingface.co (~14GB download). HF_HUB_ENABLE_HF_TRANSFER=1 uses
+      # the faster hf_transfer backend (multi-part, ~3-4× faster).
+      # To eliminate egress: stage the model with snapshot_download() here
+      # and add a basemodel S3 channel — same pattern as v5.
+      - name: Package and upload training code
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+
+          rm -rf /tmp/sourcedir && mkdir -p /tmp/sourcedir
+          cp code/train_v6.py code/inference_v6.py /tmp/sourcedir/
+          cp code/requirements-v6.txt /tmp/sourcedir/requirements.txt
+
+          tar czf /tmp/sourcedir.tar.gz -C /tmp/sourcedir .
+          aws s3 cp /tmp/sourcedir.tar.gz \
+            "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"
+          tar tzf /tmp/sourcedir.tar.gz
+
+      - name: Start SageMaker Training Job
+        id: training
+        run: |
+          set -euo pipefail
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          JOB_NAME="${PROJECT_NAME}-${TIMESTAMP}"
+          BUCKET="${{ steps.cfn.outputs.bucket }}"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          cat > /tmp/job.json <<JSON
+          {
+            "TrainingJobName": "${JOB_NAME}",
+            "RoleArn": "${ROLE_ARN}",
+            "AlgorithmSpecification": {
+              "TrainingImage": "${TRAINING_IMAGE}",
+              "TrainingInputMode": "File",
+              "MetricDefinitions": [
+                {
+                  "Name": "train:loss",
+                  "Regex": "'loss': ([0-9\\.]+)"
+                },
+                {
+                  "Name": "validation:loss",
+                  "Regex": "'eval_loss': ([0-9\\.]+)"
+                },
+                {
+                  "Name": "grad:norm",
+                  "Regex": "'grad_norm': ([0-9\\.]+)"
+                }
+              ]
+            },
+            "InputDataConfig": [
+              {
+                "ChannelName": "training",
+                "DataSource": {"S3DataSource": {
+                  "S3DataType": "S3Prefix",
+                  "S3Uri": "s3://${BUCKET}/${S3_PREFIX}/data/",
+                  "S3DataDistributionType": "FullyReplicated"
+                }}
+              }
+            ],
+            "OutputDataConfig": {"S3OutputPath": "s3://${BUCKET}/${S3_PREFIX}/models/"},
+            "ResourceConfig": {
+              "InstanceType": "${{ steps.params.outputs.instance }}",
+              "InstanceCount": 1,
+              "VolumeSizeInGB": 100
+            },
+            "StoppingCondition": {"MaxRuntimeInSeconds": 21600},
+            "Environment": {
+              "HF_HUB_ENABLE_HF_TRANSFER": "1",
+              "NCCL_DEBUG": "INFO"
+            },
+            "HyperParameters": {
+              "base-model":    "${{ steps.params.outputs.base_model }}",
+              "dataset":       "${{ steps.params.outputs.dataset }}",
+              "dataset-split": "${{ steps.params.outputs.dataset_split }}",
+              "steps":         "${{ steps.params.outputs.steps }}",
+              "batch-size":    "${{ steps.params.outputs.batch_size }}",
+              "grad-accum":    "${{ steps.params.outputs.grad_accum }}",
+              "lr":            "${{ steps.params.outputs.lr }}",
+              "lora-rank":     "${{ steps.params.outputs.lora_rank }}",
+              "lora-alpha":    "${{ steps.params.outputs.lora_rank }}",
+              "seq-len":       "${{ steps.params.outputs.seq_len }}",
+              "precision":     "auto",
+              "sagemaker_program":          "train_v6.py",
+              "sagemaker_submit_directory": "s3://${BUCKET}/${S3_PREFIX}/code/sourcedir.tar.gz"
+            },
+            "Tags": [
+              {"Key": "Project", "Value": "${PROJECT_NAME}"},
+              {"Key": "Commit",  "Value": "${{ github.sha }}"}
+            ]
+          }
+          JSON
+
+          python3 -c "import json;json.load(open('/tmp/job.json'))" && echo "job.json is valid JSON"
+          aws sagemaker create-training-job --cli-input-json file:///tmp/job.json
+
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "Started training job: $JOB_NAME"
+          echo "Note: first ~10 min is Qwen2.5-7B download (~14GB) from HF Hub"
+
+      # 200 steps on ml.g5.2xlarge takes ~30-40 min after the ~10 min model
+      # download. Total wall time ~60-90 min. Timeout at 6h to be safe.
+      - name: Wait for training to complete
+        timeout-minutes: 360
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          echo "Waiting for $JOB_NAME ..."
+
+          for i in $(seq 1 360); do
+            STATUS=$(aws sagemaker describe-training-job \
+              --training-job-name "$JOB_NAME" \
+              --query "TrainingJobStatus" --output text)
+            SECONDARY=$(aws sagemaker describe-training-job \
+              --training-job-name "$JOB_NAME" \
+              --query "SecondaryStatus" --output text)
+            echo "  [${i}m] $STATUS / $SECONDARY"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "Training completed."
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Stopped" ]; then
+              REASON=$(aws sagemaker describe-training-job \
+                --training-job-name "$JOB_NAME" \
+                --query "FailureReason" --output text)
+              echo "::error::Training $STATUS — $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+          echo "::error::Timed out after 360 minutes waiting for $JOB_NAME"
+          exit 1
+
+      - name: Get model S3 URI and final metrics
+        id: model_uri
+        run: |
+          set -euo pipefail
+          JOB_NAME="${{ steps.training.outputs.job_name }}"
+          MODEL_URI=$(aws sagemaker describe-training-job \
+            --training-job-name "$JOB_NAME" \
+            --query "ModelArtifacts.S3ModelArtifacts" --output text)
+          echo "model_s3_uri=$MODEL_URI" >> $GITHUB_OUTPUT
+
+          echo "### v6 training complete"               >> $GITHUB_STEP_SUMMARY
+          echo ""                                        >> $GITHUB_STEP_SUMMARY
+          echo "| field | value |"                       >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"                               >> $GITHUB_STEP_SUMMARY
+          echo "| job | \`$JOB_NAME\` |"                 >> $GITHUB_STEP_SUMMARY
+          echo "| base | ${{ steps.params.outputs.base_model }} |"     >> $GITHUB_STEP_SUMMARY
+          echo "| dataset | ${{ steps.params.outputs.dataset }} |"     >> $GITHUB_STEP_SUMMARY
+          echo "| steps | ${{ steps.params.outputs.steps }} |"         >> $GITHUB_STEP_SUMMARY
+          echo "| lora_rank | ${{ steps.params.outputs.lora_rank }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| artifact | \`$MODEL_URI\` |"           >> $GITHUB_STEP_SUMMARY
+
+          aws sagemaker describe-training-job --training-job-name "$JOB_NAME" \
+            --query "FinalMetricDataList" --output table || true
+
+  # ── Job 2: Register in the v6 Model Registry group ───────────────────────────
+  register:
+    name: Register v6 Model
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Register model package
+        run: |
+          set -euo pipefail
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          GROUP_NAME="${PROJECT_NAME}-models"
+
+          cat > /tmp/pkg.json <<JSON
+          {
+            "ModelPackageGroupName": "${GROUP_NAME}",
+            "ModelPackageDescription": "v6 Qwen2.5-7B QLoRA SFT (Open-Thoughts) — commit ${{ github.sha }}",
+            "InferenceSpecification": {
+              "Containers": [{
+                "Image": "${INFERENCE_IMAGE}",
+                "ModelDataUrl": "${MODEL_URI}",
+                "Environment": {
+                  "SAGEMAKER_PROGRAM": "inference_v6.py",
+                  "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code"
+                }
+              }],
+              "SupportedContentTypes":    ["application/json"],
+              "SupportedResponseMIMETypes": ["application/json"]
+            },
+            "ModelApprovalStatus": "PendingManualApproval"
+          }
+          JSON
+
+          aws sagemaker create-model-package --cli-input-json file:///tmp/pkg.json
+          echo "Registered in $GROUP_NAME — pending manual approval."
+
+  # ── Job 3: Deploy to a dedicated v6 endpoint ─────────────────────────────────
+  # Separate endpoint from v5 (tiny-transformer-v5-endpoint) so both models run
+  # side by side and a bad v6 run cannot affect v5.
+  deploy:
+    name: Deploy v6 Endpoint
+    runs-on: ubuntu-latest
+    needs: [train, register]
+    if: ${{ github.event.inputs.skip_deploy != 'true' }}
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+          role-duration-seconds: 21600
+
+      - name: Read CloudFormation outputs
+        id: cfn
+        run: |
+          ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='SageMakerRoleArn'].OutputValue" \
+            --output text)
+          echo "role_arn=$ROLE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create or update the v6 endpoint
+        run: |
+          set -euo pipefail
+          MODEL_URI="${{ needs.train.outputs.model_s3_uri }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          MODEL_NAME="${PROJECT_NAME}-model-${TIMESTAMP}"
+          CONFIG_NAME="${PROJECT_NAME}-config-${TIMESTAMP}"
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+          ROLE_ARN="${{ steps.cfn.outputs.role_arn }}"
+
+          # inference_v6.py downloads Qwen2.5-7B base from HF Hub at cold start
+          # (~14GB). HF_HUB_ENABLE_HF_TRANSFER=1 speeds this up significantly.
+          # The startup health check timeout is raised to 2700s (45 min) to
+          # accommodate the download + model loading time. Adjust down once the
+          # model is cached locally (or stage the base model to S3).
+          cat > /tmp/model.json <<JSON
+          {
+            "ModelName": "${MODEL_NAME}",
+            "ExecutionRoleArn": "${ROLE_ARN}",
+            "PrimaryContainer": {
+              "Image": "${INFERENCE_IMAGE}",
+              "ModelDataUrl": "${MODEL_URI}",
+              "Environment": {
+                "SAGEMAKER_PROGRAM": "inference_v6.py",
+                "SAGEMAKER_SUBMIT_DIRECTORY": "/opt/ml/model/code",
+                "SAGEMAKER_MODEL_SERVER_TIMEOUT": "300",
+                "SAGEMAKER_CONTAINER_LOG_LEVEL": "20",
+                "TS_DEFAULT_RESPONSE_TIMEOUT": "300",
+                "HF_HUB_ENABLE_HF_TRANSFER": "1"
+              }
+            }
+          }
+          JSON
+          aws sagemaker create-model --cli-input-json file:///tmp/model.json
+
+          cat > /tmp/config.json <<JSON
+          {
+            "EndpointConfigName": "${CONFIG_NAME}",
+            "ProductionVariants": [{
+              "VariantName": "AllTraffic",
+              "ModelName": "${MODEL_NAME}",
+              "InitialInstanceCount": 1,
+              "InstanceType": "${ENDPOINT_INSTANCE}",
+              "InitialVariantWeight": 1,
+              "ModelDataDownloadTimeoutInSeconds": 1800,
+              "ContainerStartupHealthCheckTimeoutInSeconds": 2700
+            }]
+          }
+          JSON
+          aws sagemaker create-endpoint-config --cli-input-json file:///tmp/config.json
+
+          STATUS=$(aws sagemaker describe-endpoint --endpoint-name "$ENDPOINT_NAME" \
+            --query "EndpointStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "Creating endpoint: $ENDPOINT_NAME"
+            aws sagemaker create-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          else
+            echo "Updating endpoint: $ENDPOINT_NAME (was $STATUS)"
+            aws sagemaker update-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --endpoint-config-name "$CONFIG_NAME"
+          fi
+
+      # Endpoint cold start includes the ~14GB HF download — allow 60 min.
+      - name: Wait for endpoint to be InService
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws sagemaker describe-endpoint \
+              --endpoint-name "$ENDPOINT_NAME" \
+              --query "EndpointStatus" --output text)
+            echo "  [${i}m] $STATUS"
+
+            if [ "$STATUS" = "InService" ]; then
+              echo "Endpoint is live."
+              exit 0
+            elif [ "$STATUS" = "Failed" ]; then
+              REASON=$(aws sagemaker describe-endpoint \
+                --endpoint-name "$ENDPOINT_NAME" \
+                --query "FailureReason" --output text)
+              echo "::error::Endpoint failed — $REASON"
+              exit 1
+            fi
+            sleep 60
+          done
+
+          echo "::error::Timed out waiting for $ENDPOINT_NAME"
+          exit 1
+
+      - name: Smoke test endpoint
+        run: |
+          set -euo pipefail
+          ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
+
+          aws sagemaker-runtime invoke-endpoint \
+            --endpoint-name "$ENDPOINT_NAME" \
+            --region "$AWS_REGION" \
+            --content-type "application/json" \
+            --cli-binary-format raw-in-base64-out \
+            --body '{"inputs":"What is the derivative of x^2 sin(x)?","parameters":{"max_new_tokens":200,"temperature":0.1}}' \
+            /tmp/smoke.json
+
+          echo "Response:"
+          cat /tmp/smoke.json
+
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("/tmp/smoke.json"))
+          text = r.get("generated_text", "")
+          print(f"\ninput_tokens={r.get('input_tokens')} output_tokens={r.get('output_tokens')}")
+          if not text.strip():
+              sys.exit("smoke test produced an empty completion")
+          print("Smoke test passed.")
+          PY
+
+          {
+            echo "### v6 endpoint live"
+            echo ""
+            echo "\`$ENDPOINT_NAME\` on \`${{ env.ENDPOINT_INSTANCE }}\`"
+            echo ""
+            echo '```json'
+            cat /tmp/smoke.json
+            echo ""
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY

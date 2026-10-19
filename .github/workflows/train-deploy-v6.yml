@@ -24,11 +24,11 @@ on:
       dataset:
         description: "HF dataset id with real CoT traces"
         required: false
-        default: "FreedomIntelligence/NuminaMath-CoT"
+        default: "openai/gsm8k"
       dataset_split:
-        description: "Dataset slice (e.g. train[:8000])"
+        description: "Dataset slice (e.g. train or train[:2000])"
         required: false
-        default: "train[:8000]"
+        default: "train"
       lora_rank:
         description: "LoRA rank (16 = sweet spot; raise to 32 if val loss plateaus)"
         required: false
@@ -146,13 +146,11 @@ jobs:
       - name: Install staging dependencies
         run: pip install --quiet "datasets>=2.18,<3"
 
-      # Stage the NuminaMath-CoT dataset as JSONL to the training channel.
-      # NuminaMath schema: {"problem": str, "solution": str}
-      # Normalised to the generic messages format that train_v6.py's
-      # extract_messages() handles, so swapping datasets later requires
-      # only changing this step, not train_v6.py.
-      # The dataset is re-staged each run so the slice is always in sync.
-      - name: Stage NuminaMath-CoT dataset to S3
+      # Stage the dataset as JSONL to the training channel.
+      # GSM8K schema: {"question": str, "answer": str}  (config "main" required)
+      # train_v6.py's extract_messages() also handles problem/solution and
+      # conversations formats, so swapping datasets only requires changing this step.
+      - name: Stage dataset to S3
         run: |
           set -euo pipefail
           BUCKET="${{ steps.cfn.outputs.bucket }}"
@@ -164,42 +162,45 @@ jobs:
           from datasets import load_dataset
 
           SYSTEM = "You are an expert math and coding assistant. Reason step-by-step."
-          ds = load_dataset("${DATASET}", split="${SPLIT}")
+          # GSM8K requires the "main" config; other datasets use default (None).
+          try:
+              ds = load_dataset("${DATASET}", "main", split="${SPLIT}")
+          except Exception:
+              ds = load_dataset("${DATASET}", split="${SPLIT}")
           kept = 0
           with open("/tmp/dataset.jsonl", "w", encoding="utf-8") as f:
               for row in ds:
-                  # NuminaMath-CoT: problem/solution fields
-                  problem  = (row.get("problem")  or row.get("instruction") or "").strip()
-                  solution = (row.get("solution") or row.get("output")      or "").strip()
-                  if not problem or not solution:
-                      # Fall back to conversations format (Open-Thoughts style)
-                      convs = row.get("conversations") or []
-                      if not convs:
-                          continue
+                  # GSM8K / generic QA: question+answer fields
+                  question = (row.get("question") or row.get("problem") or row.get("instruction") or "").strip()
+                  answer   = (row.get("answer")   or row.get("solution") or row.get("output")     or "").strip()
+                  if question and answer:
+                      f.write(json.dumps({
+                          "messages": [
+                              {"role": "system",    "content": SYSTEM},
+                              {"role": "user",      "content": question},
+                              {"role": "assistant", "content": answer},
+                          ]
+                      }, ensure_ascii=False) + "\n")
+                      kept += 1
+                      continue
+                  # ShareGPT / conversations format
+                  convs = row.get("conversations") or []
+                  if convs:
                       f.write(json.dumps({
                           "system": row.get("system", SYSTEM),
                           "conversations": convs,
                       }, ensure_ascii=False) + "\n")
-                  else:
-                      f.write(json.dumps({
-                          "messages": [
-                              {"role": "system",    "content": SYSTEM},
-                              {"role": "user",      "content": problem},
-                              {"role": "assistant", "content": solution},
-                          ]
-                      }, ensure_ascii=False) + "\n")
-                  kept += 1
-                  kept += 1
+                      kept += 1
           print(f"wrote {kept} conversations")
           if kept == 0:
               raise SystemExit("dataset produced 0 usable conversations")
           PY
 
-          SIZE=$(wc -c < /tmp/open_thoughts.jsonl)
-          echo "open_thoughts.jsonl: ${SIZE} bytes"
+          SIZE=$(wc -c < /tmp/dataset.jsonl)
+          echo "dataset.jsonl: ${SIZE} bytes"
 
           aws s3 rm "s3://${BUCKET}/${S3_PREFIX}/data/" --recursive --only-show-errors || true
-          aws s3 cp /tmp/open_thoughts.jsonl "s3://${BUCKET}/${S3_PREFIX}/data/open_thoughts.jsonl"
+          aws s3 cp /tmp/dataset.jsonl "s3://${BUCKET}/${S3_PREFIX}/data/dataset.jsonl"
 
       # NOTE: Unlike v5 which staged the base model weights to S3, v6 lets
       # Unsloth download Qwen2.5-7B from the HF Hub inside the training

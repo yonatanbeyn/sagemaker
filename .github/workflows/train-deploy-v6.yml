@@ -24,7 +24,7 @@ on:
       dataset:
         description: "HF dataset id with real CoT traces"
         required: false
-        default: "Open-Thoughts/Open-Thoughts-Dataset"
+        default: "FreedomIntelligence/NuminaMath-CoT"
       dataset_split:
         description: "Dataset slice (e.g. train[:8000])"
         required: false
@@ -112,7 +112,7 @@ jobs:
           {
             echo "steps=${{ github.event.inputs.steps || '200' }}"
             echo "base_model=${{ github.event.inputs.base_model || 'Qwen/Qwen2.5-7B' }}"
-            echo "dataset=${{ github.event.inputs.dataset || 'Open-Thoughts/Open-Thoughts-Dataset' }}"
+            echo "dataset=${{ github.event.inputs.dataset || 'FreedomIntelligence/NuminaMath-CoT' }}"
             echo "dataset_split=${{ github.event.inputs.dataset_split || 'train[:8000]' }}"
             echo "lora_rank=${{ github.event.inputs.lora_rank || '16' }}"
             echo "batch_size=${{ github.event.inputs.batch_size || '4' }}"
@@ -146,31 +146,49 @@ jobs:
       - name: Install staging dependencies
         run: pip install --quiet "datasets>=2.18,<3"
 
-      # Stage the Open-Thoughts dataset as JSONL to the training channel.
-      # Open-Thoughts schema: {system, conversations: [{from, value}]}
-      # train_v6.py's extract_messages() reads this format directly.
+      # Stage the NuminaMath-CoT dataset as JSONL to the training channel.
+      # NuminaMath schema: {"problem": str, "solution": str}
+      # Normalised to the generic messages format that train_v6.py's
+      # extract_messages() handles, so swapping datasets later requires
+      # only changing this step, not train_v6.py.
       # The dataset is re-staged each run so the slice is always in sync.
-      - name: Stage Open-Thoughts dataset to S3
+      - name: Stage NuminaMath-CoT dataset to S3
         run: |
           set -euo pipefail
           BUCKET="${{ steps.cfn.outputs.bucket }}"
           SPLIT="${{ steps.params.outputs.dataset_split }}"
+          DATASET="${{ steps.params.outputs.dataset }}"
 
           python3 - <<PY
           import json
           from datasets import load_dataset
 
-          ds = load_dataset("Open-Thoughts/Open-Thoughts-Dataset", split="${SPLIT}")
+          SYSTEM = "You are an expert math and coding assistant. Reason step-by-step."
+          ds = load_dataset("${DATASET}", split="${SPLIT}")
           kept = 0
-          with open("/tmp/open_thoughts.jsonl", "w", encoding="utf-8") as f:
+          with open("/tmp/dataset.jsonl", "w", encoding="utf-8") as f:
               for row in ds:
-                  convs = row.get("conversations") or []
-                  if not convs:
-                      continue
-                  f.write(json.dumps({
-                      "system": row.get("system", ""),
-                      "conversations": convs,
-                  }, ensure_ascii=False) + "\n")
+                  # NuminaMath-CoT: problem/solution fields
+                  problem  = (row.get("problem")  or row.get("instruction") or "").strip()
+                  solution = (row.get("solution") or row.get("output")      or "").strip()
+                  if not problem or not solution:
+                      # Fall back to conversations format (Open-Thoughts style)
+                      convs = row.get("conversations") or []
+                      if not convs:
+                          continue
+                      f.write(json.dumps({
+                          "system": row.get("system", SYSTEM),
+                          "conversations": convs,
+                      }, ensure_ascii=False) + "\n")
+                  else:
+                      f.write(json.dumps({
+                          "messages": [
+                              {"role": "system",    "content": SYSTEM},
+                              {"role": "user",      "content": problem},
+                              {"role": "assistant", "content": solution},
+                          ]
+                      }, ensure_ascii=False) + "\n")
+                  kept += 1
                   kept += 1
           print(f"wrote {kept} conversations")
           if kept == 0:

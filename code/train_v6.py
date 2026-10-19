@@ -61,11 +61,11 @@ os.makedirs(SM_OUTPUT_DATA_DIR, exist_ok=True)
 parser = argparse.ArgumentParser()
 parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-7B",
                     help="HuggingFace model id. Must be a BASE (not Instruct) model.")
-parser.add_argument("--dataset", type=str, default="Open-Thoughts/Open-Thoughts-Dataset",
+parser.add_argument("--dataset", type=str, default="FreedomIntelligence/NuminaMath-CoT",
                     help="HF dataset id with real CoT traces.")
 parser.add_argument("--dataset-split", type=str, default="train[:8000]",
                     help="Dataset slice. 8000 rows is one solid pass with effective batch 16.")
-# 2048 captures ~85% of Open-Thoughts traces on a 24GB A10G.
+# 2048 captures ~85% of NuminaMath-CoT traces on a 24GB A10G.
 # Raise to 4096 on ml.g5.4xlarge (or with gradient_accumulation to compensate).
 # Do NOT set above 4096 with 4-bit QLoRA on a single A10G — OOM during backprop.
 parser.add_argument("--seq-len", type=int, default=2048)
@@ -234,10 +234,25 @@ SYSTEM_PROMPT = "You are an expert math and coding assistant. Reason step-by-ste
 
 def extract_messages(row):
     """
-    Normalise a row from Open-Thoughts or a JSONL override to a messages list.
-    Open-Thoughts schema: {"system": str, "conversations": [{"from": "human"|"gpt", "value": str}]}
-    Fallback: {"messages": [{"role": str, "content": str}]}
+    Normalise a dataset row to a messages list.
+
+    Supported schemas (tried in order):
+      NuminaMath-CoT : {"problem": str, "solution": str}
+      Open-Thoughts  : {"system": str, "conversations": [{"from": "human"|"gpt", "value": str}]}
+      Generic chat   : {"messages": [{"role": str, "content": str}]}
     """
+    # NuminaMath-CoT and similar problem/solution datasets
+    if "problem" in row and "solution" in row:
+        problem = (row.get("problem") or "").strip()
+        solution = (row.get("solution") or "").strip()
+        if not problem or not solution:
+            return []
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": problem},
+            {"role": "assistant", "content": solution},
+        ]
+    # Open-Thoughts / ShareGPT conversation format
     if "conversations" in row:
         system = row.get("system", SYSTEM_PROMPT) or SYSTEM_PROMPT
         msgs = [{"role": "system", "content": system}]
@@ -248,6 +263,7 @@ def extract_messages(row):
             if content:
                 msgs.append({"role": role, "content": content})
         return msgs
+    # Generic messages format
     if "messages" in row:
         return row["messages"]
     return []

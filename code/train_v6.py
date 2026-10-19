@@ -61,10 +61,10 @@ os.makedirs(SM_OUTPUT_DATA_DIR, exist_ok=True)
 parser = argparse.ArgumentParser()
 parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-7B",
                     help="HuggingFace model id. Must be a BASE (not Instruct) model.")
-parser.add_argument("--dataset", type=str, default="FreedomIntelligence/NuminaMath-CoT",
+parser.add_argument("--dataset", type=str, default="openai/gsm8k",
                     help="HF dataset id with real CoT traces.")
-parser.add_argument("--dataset-split", type=str, default="train[:8000]",
-                    help="Dataset slice. 8000 rows is one solid pass with effective batch 16.")
+parser.add_argument("--dataset-split", type=str, default="train",
+                    help="Dataset slice. GSM8K train split has ~7.5k examples.")
 # 2048 captures ~85% of NuminaMath-CoT traces on a 24GB A10G.
 # Raise to 4096 on ml.g5.4xlarge (or with gradient_accumulation to compensate).
 # Do NOT set above 4096 with 4-bit QLoRA on a single A10G — OOM during backprop.
@@ -237,10 +237,22 @@ def extract_messages(row):
     Normalise a dataset row to a messages list.
 
     Supported schemas (tried in order):
-      NuminaMath-CoT : {"problem": str, "solution": str}
+      GSM8K          : {"question": str, "answer": str}
+      problem/sol    : {"problem": str, "solution": str}
       Open-Thoughts  : {"system": str, "conversations": [{"from": "human"|"gpt", "value": str}]}
       Generic chat   : {"messages": [{"role": str, "content": str}]}
     """
+    # GSM8K: {"question": str, "answer": str}
+    if "question" in row and "answer" in row:
+        question = (row.get("question") or "").strip()
+        answer = (row.get("answer") or "").strip()
+        if not question or not answer:
+            return []
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
     # NuminaMath-CoT and similar problem/solution datasets
     if "problem" in row and "solution" in row:
         problem = (row.get("problem") or "").strip()

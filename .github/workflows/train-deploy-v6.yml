@@ -376,6 +376,18 @@ jobs:
           aws-region:     ${{ env.AWS_REGION }}
           role-duration-seconds: 21600
 
+      - name: Ensure Model Package Group exists
+        run: |
+          set -euo pipefail
+          GROUP_NAME="${PROJECT_NAME}-models"
+          aws sagemaker describe-model-package-group \
+            --model-package-group-name "$GROUP_NAME" \
+            --query "ModelPackageGroupName" --output text 2>/dev/null \
+          || aws sagemaker create-model-package-group \
+            --model-package-group-name "$GROUP_NAME" \
+            --model-package-group-description "v6 Qwen2.5-7B QLoRA SFT model registry"
+          echo "Model Package Group: $GROUP_NAME"
+
       - name: Register model package
         run: |
           set -euo pipefail

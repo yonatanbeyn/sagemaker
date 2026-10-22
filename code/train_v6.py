@@ -65,6 +65,7 @@ def _check_imports():
         "bitsandbytes":    "bitsandbytes",
         "trl":             "trl",
         "unsloth":         "unsloth",
+        "torchaudio":      "torchaudio",
     }
     failed = []
     for label, module in required.items():
@@ -81,7 +82,7 @@ def _check_imports():
     # Print resolved versions for the training log
     import importlib.metadata as meta
     print("[PRE-FLIGHT] All imports OK. Key package versions:")
-    for pkg in ["torch", "torchvision", "numpy", "transformers", "trl", "unsloth", "peft", "bitsandbytes", "datasets", "accelerate"]:
+    for pkg in ["torch", "torchvision", "torchaudio", "numpy", "transformers", "trl", "unsloth", "peft", "bitsandbytes", "datasets", "accelerate"]:
         try:
             print(f"  {pkg}=={meta.version(pkg)}")
         except meta.PackageNotFoundError:

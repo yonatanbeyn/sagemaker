@@ -197,7 +197,7 @@ print(f"  LoRA adapter params (trainable): {trainable_params / 1e6:.1f}M "
 print(f"\n[2/5] Loading reasoning dataset '{args.dataset}' ...")
 
 from datasets import load_dataset
-from transformers import DataCollatorForCompletionOnlyLM
+from trl import DataCollatorForCompletionOnlyLM
 
 raw_rows = []
 

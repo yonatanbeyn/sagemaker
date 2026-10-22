@@ -242,15 +242,15 @@ jobs:
               "MetricDefinitions": [
                 {
                   "Name": "train:loss",
-                  "Regex": "'loss': ([0-9\\.]+)"
+                  "Regex": "'loss': ([0-9.]+)"
                 },
                 {
                   "Name": "validation:loss",
-                  "Regex": "'eval_loss': ([0-9\\.]+)"
+                  "Regex": "'eval_loss': ([0-9.]+)"
                 },
                 {
                   "Name": "grad:norm",
-                  "Regex": "'grad_norm': ([0-9\\.]+)"
+                  "Regex": "'grad_norm': ([0-9.]+)"
                 }
               ]
             },

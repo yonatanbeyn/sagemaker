@@ -261,36 +261,6 @@ print(f"\n[2/5] Loading reasoning dataset '{args.dataset}' ...")
 
 from datasets import load_dataset
 
-try:
-    from trl import DataCollatorForCompletionOnlyLM
-except ImportError:
-    try:
-        from trl.trainer.utils import DataCollatorForCompletionOnlyLM
-    except ImportError:
-        import torch
-        from transformers import default_data_collator
-
-        class DataCollatorForCompletionOnlyLM:
-            """Inline fallback — masks all tokens before the response template."""
-            def __init__(self, response_template, tokenizer, **_):
-                self.tpl_ids = tokenizer.encode(response_template, add_special_tokens=False)
-                self.tokenizer = tokenizer
-
-            def __call__(self, features):
-                batch = default_data_collator(features)
-                labels = batch["input_ids"].clone()
-                tpl = self.tpl_ids
-                for i in range(len(labels)):
-                    seq = labels[i].tolist()
-                    start = None
-                    for j in range(len(seq) - len(tpl) + 1):
-                        if seq[j: j + len(tpl)] == tpl:
-                            start = j
-                    labels[i, : (start + len(tpl)) if start is not None else len(seq)] = -100
-                labels[batch.get("attention_mask", torch.ones_like(labels)) == 0] = -100
-                batch["labels"] = labels
-                return batch
-
 raw_rows = []
 
 # Check if training channel has JSONL overrides first
@@ -415,17 +385,6 @@ if planned_epochs < 0.8:
 elif planned_epochs > 3:
     print(f"  NOTE: {planned_epochs:.1f} epochs — watch for memorisation (loss → 0).")
 
-# DataCollatorForCompletionOnlyLM masks everything BEFORE the assistant's
-# response_template from the loss. This is the canonical TRL way to do
-# completion-only SFT and is more robust than manual -100 labels.
-# Open-Thoughts uses 'gpt' as the assistant label internally, but after
-# apply_chat_template it becomes <|im_start|>assistant\n — so we mask on that.
-response_template = "<|im_start|>assistant\n"
-collator = DataCollatorForCompletionOnlyLM(
-    response_template=response_template,
-    tokenizer=tokenizer,
-)
-
 # ── 4. SFT training ──────────────────────────────────────────────────────────
 print(f"\n[4/5] Fine-tuning for {args.steps} steps ...")
 
@@ -434,9 +393,6 @@ from trl import SFTTrainer, SFTConfig
 checkpoint_dir = os.path.join(SM_OUTPUT_DATA_DIR, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
-# SFTConfig is a drop-in superset of TrainingArguments (TRL 1.x+).
-# SFT-specific kwargs (max_seq_length, packing, dataset_text_field) moved
-# out of SFTTrainer and into SFTConfig in TRL 1.x.
 training_args = SFTConfig(
     per_device_train_batch_size=args.batch_size,
     gradient_accumulation_steps=args.grad_accum,
@@ -446,7 +402,7 @@ training_args = SFTConfig(
     bf16=(precision == "bf16"),
     fp16=(precision == "fp16"),
     logging_steps=args.log_interval,
-    optim="adamw_bnb_8bit",     # renamed from adamw_8bit in transformers 4.35
+    optim="adamw_bnb_8bit",
     weight_decay=args.weight_decay,
     lr_scheduler_type="cosine",
     seed=args.seed,
@@ -460,7 +416,6 @@ training_args = SFTConfig(
     metric_for_best_model="eval_loss",
     greater_is_better=False,
     report_to="none",
-    # SFT-specific — live in SFTConfig, not SFTTrainer, in TRL 1.x
     max_seq_length=args.seq_len,
     dataset_text_field="text",
     packing=False,
@@ -468,11 +423,21 @@ training_args = SFTConfig(
 
 trainer = SFTTrainer(
     model=model,
-    processing_class=tokenizer,  # renamed from tokenizer in TRL 1.x
+    processing_class=tokenizer,
     train_dataset=train_data,
     eval_dataset=val_data,
-    data_collator=collator,
     args=training_args,
+)
+
+# Apply completion-only masking via Unsloth's native utility.
+# This is the recommended approach with Unsloth — handles padding and token
+# alignment correctly, unlike a custom DataCollator which breaks on variable
+# sequence lengths.
+from unsloth.chat_templates import train_on_responses_only
+trainer = train_on_responses_only(
+    trainer,
+    instruction_part="<|im_start|>user\n",
+    response_part="<|im_start|>assistant\n",
 )
 
 start_time = time.time()
@@ -541,7 +506,7 @@ metadata = {
         "train_examples": len(train_data),
         "val_examples": n_val,
         "planned_epochs": round(planned_epochs, 3),
-        "response_template": response_template,
+        "response_template": "<|im_start|>assistant\n",
     },
     "results": {
         "final_train_loss": round(train_result.training_loss, 6),

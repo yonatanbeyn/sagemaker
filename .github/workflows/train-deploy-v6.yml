@@ -112,8 +112,8 @@ jobs:
           {
             echo "steps=${{ github.event.inputs.steps || '200' }}"
             echo "base_model=${{ github.event.inputs.base_model || 'Qwen/Qwen2.5-7B' }}"
-            echo "dataset=${{ github.event.inputs.dataset || 'FreedomIntelligence/NuminaMath-CoT' }}"
-            echo "dataset_split=${{ github.event.inputs.dataset_split || 'train[:8000]' }}"
+            echo "dataset=${{ github.event.inputs.dataset || 'openai/gsm8k' }}"
+            echo "dataset_split=${{ github.event.inputs.dataset_split || 'train' }}"
             echo "lora_rank=${{ github.event.inputs.lora_rank || '16' }}"
             echo "batch_size=${{ github.event.inputs.batch_size || '4' }}"
             echo "grad_accum=${{ github.event.inputs.grad_accum || '4' }}"

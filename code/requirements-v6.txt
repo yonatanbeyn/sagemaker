@@ -1,4 +1,5 @@
 unsloth>=2024.8
+torchvision>=0.29.0
 transformers>=4.40.0
 datasets>=2.18.0
 trl>=0.8.6

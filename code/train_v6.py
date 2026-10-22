@@ -37,6 +37,29 @@ Instance recommendation: ml.g5.2xlarge (24GB A10G, bfloat16 native).
 For very long CoT chains (>2048 tokens) use ml.g5.4xlarge and raise --seq-len.
 """
 
+import subprocess
+import sys
+
+# ── Torch ecosystem bootstrap ────────────────────────────────────────────────
+# Must run before ANY torch import. The DLC pre-installs torchvision/torchaudio
+# compiled for its bundled torch version. Unsloth upgrades torch, which breaks
+# those native binaries (.so undefined symbol). Force-reinstalling all three
+# from the PyTorch cu121 wheel index ensures they match.
+def _bootstrap_torch():
+    print("[BOOTSTRAP] Reinstalling torch ecosystem for version consistency ...")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+         "torch", "torchvision", "torchaudio",
+         "--extra-index-url", "https://download.pytorch.org/whl/cu121"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"[BOOTSTRAP] pip stderr: {r.stderr[-1000:]}")
+    else:
+        print("[BOOTSTRAP] torch ecosystem reinstalled OK.")
+
+_bootstrap_torch()
+
 import argparse
 import contextlib
 import glob
@@ -45,7 +68,6 @@ import math
 import os
 import random
 import shutil
-import sys
 import time
 
 import torch

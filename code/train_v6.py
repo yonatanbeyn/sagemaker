@@ -45,9 +45,49 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 
 import torch
+
+# ── Pre-flight import check ──────────────────────────────────────────────────
+# Validates every third-party dependency before any real work starts.
+# Fails immediately with a clear message instead of crashing mid-training.
+def _check_imports():
+    required = {
+        "numpy":           "numpy",
+        "torch":           "torch",
+        "torchvision":     "torchvision",
+        "transformers":    "transformers",
+        "datasets":        "datasets",
+        "peft":            "peft",
+        "accelerate":      "accelerate",
+        "bitsandbytes":    "bitsandbytes",
+        "trl":             "trl",
+        "unsloth":         "unsloth",
+    }
+    failed = []
+    for label, module in required.items():
+        try:
+            __import__(module)
+        except ImportError as e:
+            failed.append(f"  ✗ {label}: {e}")
+    if failed:
+        print("\n[PRE-FLIGHT] Import check FAILED — missing packages:\n" + "\n".join(failed))
+        print("\nInstalled packages:")
+        os.system(f"{sys.executable} -m pip list --format=columns 2>/dev/null | grep -E 'torch|trl|unsloth|numpy|peft|bitsandbytes|transformers|datasets|torchvision|accelerate'")
+        sys.exit(1)
+
+    # Print resolved versions for the training log
+    import importlib.metadata as meta
+    print("[PRE-FLIGHT] All imports OK. Key package versions:")
+    for pkg in ["torch", "torchvision", "numpy", "transformers", "trl", "unsloth", "peft", "bitsandbytes", "datasets", "accelerate"]:
+        try:
+            print(f"  {pkg}=={meta.version(pkg)}")
+        except meta.PackageNotFoundError:
+            print(f"  {pkg}==<not found via metadata>")
+
+_check_imports()
 
 # ── SageMaker environment ────────────────────────────────────────────────────
 SM_CHANNEL_TRAINING = os.environ.get("SM_CHANNEL_TRAINING", "./data")

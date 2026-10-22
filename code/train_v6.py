@@ -429,49 +429,49 @@ collator = DataCollatorForCompletionOnlyLM(
 # ── 4. SFT training ──────────────────────────────────────────────────────────
 print(f"\n[4/5] Fine-tuning for {args.steps} steps ...")
 
-from transformers import TrainingArguments
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 
 checkpoint_dir = os.path.join(SM_OUTPUT_DATA_DIR, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
-training_args = TrainingArguments(
+# SFTConfig is a drop-in superset of TrainingArguments (TRL 1.x+).
+# SFT-specific kwargs (max_seq_length, packing, dataset_text_field) moved
+# out of SFTTrainer and into SFTConfig in TRL 1.x.
+training_args = SFTConfig(
     per_device_train_batch_size=args.batch_size,
     gradient_accumulation_steps=args.grad_accum,
     warmup_steps=args.warmup_steps,
     max_steps=args.steps,
     learning_rate=args.lr,
-    # bf16/fp16 is set based on runtime hardware detection above, not the
-    # instance type name. A10G → bf16. T4/V100 → fp16. CPU → fp32.
     bf16=(precision == "bf16"),
     fp16=(precision == "fp16"),
     logging_steps=args.log_interval,
-    optim="adamw_8bit",         # 8-bit Adam cuts optimizer state memory in half
+    optim="adamw_bnb_8bit",     # renamed from adamw_8bit in transformers 4.35
     weight_decay=args.weight_decay,
     lr_scheduler_type="cosine",
     seed=args.seed,
     output_dir=checkpoint_dir,
     save_strategy="steps",
     save_steps=args.eval_interval,
-    save_total_limit=1,         # rolling checkpoint — keep only the latest
+    save_total_limit=1,
     eval_strategy="steps" if val_data is not None else "no",
     eval_steps=args.eval_interval if val_data is not None else None,
     load_best_model_at_end=(val_data is not None),
     metric_for_best_model="eval_loss",
     greater_is_better=False,
-    report_to="none",           # no wandb / tensorboard in the SageMaker container
+    report_to="none",
+    # SFT-specific — live in SFTConfig, not SFTTrainer, in TRL 1.x
+    max_seq_length=args.seq_len,
+    dataset_text_field="text",
+    packing=False,
 )
 
 trainer = SFTTrainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,  # renamed from tokenizer in TRL 1.x
     train_dataset=train_data,
     eval_dataset=val_data,
-    dataset_text_field="text",
-    max_seq_length=args.seq_len,
     data_collator=collator,
-    packing=False,              # packing can mix reasoning traces from different
-                                # problems; off keeps each example isolated
     args=training_args,
 )
 

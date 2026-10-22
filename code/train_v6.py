@@ -197,7 +197,36 @@ print(f"  LoRA adapter params (trainable): {trainable_params / 1e6:.1f}M "
 print(f"\n[2/5] Loading reasoning dataset '{args.dataset}' ...")
 
 from datasets import load_dataset
-from trl import DataCollatorForCompletionOnlyLM
+
+try:
+    from trl import DataCollatorForCompletionOnlyLM
+except ImportError:
+    try:
+        from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+    except ImportError:
+        import torch
+        from transformers import default_data_collator
+
+        class DataCollatorForCompletionOnlyLM:
+            """Inline fallback — masks all tokens before the response template."""
+            def __init__(self, response_template, tokenizer, **_):
+                self.tpl_ids = tokenizer.encode(response_template, add_special_tokens=False)
+                self.tokenizer = tokenizer
+
+            def __call__(self, features):
+                batch = default_data_collator(features)
+                labels = batch["input_ids"].clone()
+                tpl = self.tpl_ids
+                for i in range(len(labels)):
+                    seq = labels[i].tolist()
+                    start = None
+                    for j in range(len(seq) - len(tpl) + 1):
+                        if seq[j: j + len(tpl)] == tpl:
+                            start = j
+                    labels[i, : (start + len(tpl)) if start is not None else len(seq)] = -100
+                labels[batch.get("attention_mask", torch.ones_like(labels)) == 0] = -100
+                batch["labels"] = labels
+                return batch
 
 raw_rows = []
 

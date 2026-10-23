@@ -23,7 +23,8 @@ DEFAULT_TEMPERATURE = 0.1   # low temperature → deterministic reasoning
 def model_fn(model_dir):
     global _model, _tokenizer
 
-    from unsloth import FastLanguageModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import PeftModel
 
     adapter_path = os.path.join(model_dir, "lora_adapter")
     meta_path = os.path.join(model_dir, "metadata.json")
@@ -37,32 +38,35 @@ def model_fn(model_dir):
     else:
         base_model = "Qwen/Qwen2.5-7B"
 
-    # Detect precision from hardware, same logic as train_v6.py.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda" and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    elif device.type == "cuda":
-        dtype = torch.float16
+    # Detect precision from hardware.
+    use_cuda = torch.cuda.is_available()
+    if use_cuda and torch.cuda.is_bf16_supported():
+        compute_dtype = torch.bfloat16
+    elif use_cuda:
+        compute_dtype = torch.float16
     else:
-        dtype = None
+        compute_dtype = torch.float32
 
-    _model, _tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
-        max_seq_length=seq_len,
-        dtype=dtype,
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
     )
 
-    # Load the LoRA adapter and merge into the base weights for faster inference.
-    from peft import PeftModel
+    # Load base model with 4-bit quantization, then apply LoRA adapter.
+    # Using standard HF APIs — no unsloth dependency at inference time.
+    _model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+    )
     _model = PeftModel.from_pretrained(_model, adapter_path)
     _model = _model.merge_and_unload()
+    _model.eval()
 
-    FastLanguageModel.for_inference(_model)
-
-    # Load the tokenizer with the ChatML tokens injected at train time.
-    from transformers import AutoTokenizer
-    _tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+    _tokenizer = AutoTokenizer.from_pretrained(adapter_path, trust_remote_code=True)
 
     return _model
 

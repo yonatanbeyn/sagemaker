@@ -543,8 +543,9 @@ for fname in ["inference_v6.py"]:
         print(f"  Bundled {fname} → code/{fname}")
 
 with open(os.path.join(code_dir, "requirements.txt"), "w") as f:
+    # No unsloth here — it would upgrade torch and break TorchServe's NCCL linkage.
+    # The saved LoRA adapter is a standard PEFT checkpoint; plain HF libs are enough.
     f.write(
-        "unsloth>=2024.8\n"
         "transformers>=4.40.0\n"
         "peft>=0.10.0\n"
         "accelerate>=0.29.0\n"

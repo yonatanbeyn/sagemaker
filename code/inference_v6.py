@@ -80,6 +80,15 @@ def model_fn(model_dir):
     return _model
 
 
+def ping_fn(model_dir):
+    # Return 503 until model_fn has finished. SageMaker polls /ping and only
+    # transitions to InService when it gets 200. This prevents the first real
+    # request from racing with the model download + load (which can take 20+ min).
+    if _model is None or _tokenizer is None:
+        return 503
+    return 200
+
+
 def input_fn(request_body, content_type="application/json"):
     if content_type == "application/json":
         return json.loads(request_body)

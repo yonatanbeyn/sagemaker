@@ -76,7 +76,7 @@ env:
   # v6 serves a 4-bit Qwen model — needs a GPU inference instance.
   # ml.g5.xlarge (A10G 24GB) is the cheapest option that fits Qwen2.5-7B in
   # 4-bit (~5GB VRAM) with room for the KV cache at inference time.
-  INFERENCE_IMAGE: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.4.0-gpu-py311-cu121-ubuntu20.04-sagemaker
+  INFERENCE_IMAGE: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.3.0-gpu-py311-cu121-ubuntu20.04-sagemaker
   ENDPOINT_INSTANCE: ml.g5.xlarge
 
 jobs:

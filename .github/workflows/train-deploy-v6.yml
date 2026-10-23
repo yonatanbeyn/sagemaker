@@ -544,11 +544,14 @@ jobs:
           set -euo pipefail
           ENDPOINT_NAME="${PROJECT_NAME}-endpoint"
 
+          # First inference on a fresh endpoint can take 60-120s while the model
+          # warms up in GPU memory. Set read timeout to 300s to avoid false failures.
           aws sagemaker-runtime invoke-endpoint \
             --endpoint-name "$ENDPOINT_NAME" \
             --region "$AWS_REGION" \
             --content-type "application/json" \
             --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 300 \
             --body '{"inputs":"What is the derivative of x^2 sin(x)?","parameters":{"max_new_tokens":200,"temperature":0.1}}' \
             /tmp/smoke.json
 

@@ -191,6 +191,9 @@ Resources:
               # Model registry
               - Effect: Allow
                 Action:
+                  - sagemaker:CreateModelPackageGroup
+                  - sagemaker:DescribeModelPackageGroup
+                  - sagemaker:ListModelPackageGroups
                   - sagemaker:CreateModelPackage
                   - sagemaker:DescribeModelPackage
                   - sagemaker:ListModelPackages

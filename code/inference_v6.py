@@ -62,11 +62,20 @@ def model_fn(model_dir):
         device_map="auto",
         trust_remote_code=True,
     )
+    # Keep adapter active (no merge_and_unload) — dequantizing 7B params is slow
+    # and memory-heavy; PEFT inference with active LoRA is fine for serving.
     _model = PeftModel.from_pretrained(_model, adapter_path)
-    _model = _model.merge_and_unload()
     _model.eval()
 
     _tokenizer = AutoTokenizer.from_pretrained(adapter_path, trust_remote_code=True)
+
+    # Warmup: compile CUDA kernels on a dummy input so the first real request
+    # is not penalised by JIT compilation (which can take 30-120s on 7B models).
+    if torch.cuda.is_available():
+        dummy = _tokenizer("warmup", return_tensors="pt").to(_model.device)
+        with torch.no_grad():
+            _model.generate(**dummy, max_new_tokens=1, pad_token_id=_tokenizer.eos_token_id)
+        print("[WARMUP] CUDA kernels compiled.")
 
     return _model
 
